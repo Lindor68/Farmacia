@@ -1,0 +1,20 @@
+# Datos de origen (exports que se reemplazan cada mes)
+Sal_Art_*.xlsx
+Consumos_Historicos.xlsx
+Consumos_historicos.csv
+Consumos_Historicos.csv
+
+# Archivos generados por los scripts
+consolidado.xlsx
+pedido_proyectado.xlsx
+pedido_proyectado_backup.xlsx
+resumen_stock_BFC.xlsx
+resumen_stock_BFC_backup.xlsx
+dashboard_farmacia.html
+
+# Python
+__pycache__/
+*.pyc
+
+# Config local de Claude Code
+.claude/
