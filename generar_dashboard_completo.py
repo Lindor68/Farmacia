@@ -22,6 +22,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 import re
 import json
+import pickle
+import hashlib
 import pandas as pd
 import numpy as np
 from plotly.offline import get_plotlyjs
@@ -30,6 +32,8 @@ from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.utils import get_column_letter
+
+import pronostico_demanda
 
 carpeta = Path(__file__).resolve().parent
 
@@ -162,6 +166,22 @@ total_max_resto = (resto.groupby("Código", as_index=False)["Stock Máx."].sum()
 
 nombres = (cons.drop_duplicates("Código")[["Código", "Nombre Artículo", "Proveedor"]]
            .rename(columns={"Nombre Artículo": "Medicamento"}))
+
+# Categoría/programa: columna presente en los archivos de stock pero vacía en
+# casi todos los productos (limitación de origen, documentada en Metodología).
+# Se guarda aparte (no se agrega a `salida`/Excel) solo para poder ofrecer el
+# filtro de categoría en el dashboard sin tocar el esquema del resumen actual.
+if "Categoría" in cons.columns:
+    categoria_por_codigo = dict(zip(
+        cons.drop_duplicates("Código")["Código"], cons.drop_duplicates("Código")["Categoría"]
+    ))
+else:
+    categoria_por_codigo = {}
+
+
+def _categoria_de(codigo):
+    val = categoria_por_codigo.get(int(codigo))
+    return str(val).strip() if pd.notna(val) and str(val).strip() else "Sin categoría"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -357,6 +377,7 @@ for _, r in salida.iterrows():
         "compra3":        float(r["Necesidad Compra 3M"]),
         "compra6":        float(r["Necesidad Compra 6M"]),
         "alerta":         str(r["Alerta Stock"]),
+        "categoria":      _categoria_de(r["Código"]),
     })
 
 codigos_arsenal = {p["codigo"] for p in productos}
@@ -384,6 +405,142 @@ print(f"Serie de consumo embebida: {len(consumo_serie)} filas (codigo x mes) "
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# PASO 8B: MÓDULO DE PRONÓSTICO DE DEMANDA (pronostico_demanda.py)
+#
+# Se pronostica cada combinación código+establecimiento y también el agregado
+# de red por código, evaluando varios métodos con validación temporal y
+# seleccionando el mejor por serie (ver pronostico_demanda.py para el detalle
+# de calidad de datos, modelos y métricas). Es un cálculo pesado (miles de
+# series), por lo que se cachea por huella de los archivos fuente: si
+# Consumos_Historicos.xlsx y los Sal_Art_*.xlsx no cambiaron desde la última
+# corrida, se reusa el resultado en vez de recalcular todo de nuevo.
+#
+# NOTA IMPORTANTE (transparencia de datos): los archivos de stock
+# (Sal_Art_*.xlsx) no traen una columna que los vincule 1 a 1 con las
+# columnas de establecimiento de Consumos_Historicos.xlsx, así que el stock
+# NO se puede cruzar por establecimiento individual. Por eso el pronóstico de
+# CONSUMO sí está disponible por establecimiento (para el gráfico histórico),
+# pero los indicadores de ABASTECIMIENTO (stock de seguridad, punto de
+# pedido, compra sugerida, cobertura, semáforo) solo pueden calcularse sobre
+# los dos ámbitos de stock que sí existen en los datos: "Red completa"
+# (Total Saldos) o "Solo BFC" (Saldo BFC, la bodega central que compra), y se
+# recalculan en el navegador contra el pronóstico agregado de red.
+# ════════════════════════════════════════════════════════════════════════════
+RUTA_CACHE_PRONOSTICO = carpeta / ".pronostico_cache.pkl"
+
+
+def _huella_archivos(rutas):
+    partes = []
+    for r in rutas:
+        try:
+            st = r.stat()
+            partes.append(f"{r.name}:{st.st_mtime_ns}:{st.st_size}")
+        except FileNotFoundError:
+            partes.append(f"{r.name}:ausente")
+    return hashlib.sha256("|".join(partes).encode()).hexdigest()
+
+
+huella_actual = _huella_archivos([RUTA_CONSUMOS, *archivos_stock])
+resultado_pronostico = None
+
+if RUTA_CACHE_PRONOSTICO.exists():
+    try:
+        with open(RUTA_CACHE_PRONOSTICO, "rb") as f:
+            cache_pronostico = pickle.load(f)
+        if cache_pronostico.get("huella") == huella_actual:
+            resultado_pronostico = cache_pronostico["resultado"]
+            print("Pronósticos: usando caché (archivos fuente sin cambios desde la última corrida)")
+    except Exception:
+        resultado_pronostico = None
+
+if resultado_pronostico is None:
+    try:
+        precios_por_codigo = dict(zip(df["Código"], df["Ult. Precio"]))
+        print("Pronósticos: no hay caché válida, calculando (puede tardar varios minutos)...")
+        resultado_pronostico = pronostico_demanda.generar_pronosticos(ch, cols_consumo, precios_por_codigo)
+        with open(RUTA_CACHE_PRONOSTICO, "wb") as f:
+            pickle.dump({"huella": huella_actual, "resultado": resultado_pronostico}, f)
+    except Exception as exc:
+        print(f"AVISO: el módulo de pronóstico falló ({exc}); el dashboard se genera sin esa sección.")
+        resultado_pronostico = {"series": [], "calidad": {}, "clasificacion": {}}
+
+indice_centro = {col: i for i, col in enumerate(cols_centro)}
+
+
+def _compactar_pronosticos(series):
+    filas = []
+    for s in series:
+        establecimiento = "RED" if s["establecimiento"] == "RED" else indice_centro.get(s["establecimiento"])
+        if establecimiento is None:
+            continue
+        met = s["metricas"] or {}
+        filas.append({
+            "c": s["codigo"], "e": establecimiento, "mod": s["modelo"], "nc": s["nivel_confianza"],
+            "wape": round(met["wape"], 4) if met.get("wape") is not None else None,
+            "mase": round(met["mase"], 3) if met.get("mase") is not None else None,
+            "sesgo": round(met["sesgo"], 2) if met.get("sesgo") is not None else None,
+            "sig": round(float(s["sigma"]), 2),
+            "f":  [round(float(v), 1) for v in s["forecast"]],
+            "l8": [round(float(v), 1) for v in s["li80"]],
+            "u8": [round(float(v), 1) for v in s["ls80"]],
+            "l9": [round(float(v), 1) for v in s["li95"]],
+            "u9": [round(float(v), 1) for v in s["ls95"]],
+        })
+    return filas
+
+
+pronosticos_compactos = _compactar_pronosticos(resultado_pronostico["series"])
+clasificacion_abc_xyz = {
+    str(codigo): v for codigo, v in resultado_pronostico["clasificacion"].items()
+}
+calidad_datos = resultado_pronostico["calidad"]
+
+METODOLOGIA = {
+    "modelosDesc": pronostico_demanda.DESCRIPCION_MODELOS,
+    "periodoEntrenamiento": f"{ch['Fecha'].min().strftime('%Y-%m')} a {fecha_max.strftime('%Y-%m')}",
+    "horizontes": [3, 6, 12],
+    "metricas": ["MAE", "RMSE", "WAPE", "MASE", "Sesgo del pronóstico"],
+    "reglasHistoria": [
+        f"Menos de {pronostico_demanda.MIN_MESES_NO_ESTACIONAL} meses de historia: "
+        "\"historia insuficiente\", se usa un promedio simple claramente identificado.",
+        f"Entre {pronostico_demanda.MIN_MESES_NO_ESTACIONAL} y "
+        f"{pronostico_demanda.MIN_MESES_ESTACIONAL - 1} meses: solo modelos no estacionales.",
+        f"Desde {pronostico_demanda.MIN_MESES_ESTACIONAL} meses: se habilitan también modelos "
+        "estacionales (Holt-Winters, SARIMA, naive estacional).",
+    ],
+    "supuestos": [
+        "Los meses sin registro dentro de la vida activa de un producto se tratan como 0 para "
+        "el modelo, pero se cuentan y se muestran aparte (no se inventan valores).",
+        "Los consumos negativos detectados se corrigen a 0 antes de modelar (error de origen).",
+        "El lead time de reposición, el múltiplo de compra y el nivel de servicio son parámetros "
+        "configurables en el dashboard (no existen en los datos fuente por producto/proveedor).",
+        "La selección de modelo usa validación temporal walk-forward: nunca se entrena con datos "
+        "posteriores al período que se está evaluando.",
+        "SARIMA solo se evalúa sobre el agregado de red por producto (no por establecimiento), "
+        "por ser el modelo más costoso de ajustar y el de menor aporte en series delgadas.",
+    ],
+    "limitaciones": [
+        "No existe fecha de vencimiento/caducidad en los archivos fuente: el riesgo de "
+        "vencimiento se muestra como \"No disponible\", no se calcula.",
+        "No existe stock en tránsito real (compras ya despachadas por el proveedor) en los "
+        "archivos fuente: se asume 0 salvo que el usuario lo indique manualmente en el dashboard.",
+        "Los archivos de stock (Sal_Art_*) no tienen una columna que los vincule con las "
+        "columnas de establecimiento de Consumos_Historicos: los indicadores de abastecimiento "
+        "se calculan sobre el stock de toda la red o sobre BFC, no por punto de dispensación.",
+        "La columna \"Categoría\" de los archivos de stock viene vacía en casi todos los "
+        "productos; el filtro por categoría/programa quedará mayormente en \"Sin categoría\".",
+        "Todas las cifras de pronóstico son estimaciones estadísticas sujetas a incertidumbre, "
+        "no valores exactos.",
+    ],
+}
+
+print(f"Calidad de datos: {calidad_datos.get('codigos_historia_insuficiente', 0)} códigos con "
+      f"historia insuficiente, {calidad_datos.get('duplicados_codigo_fecha', 0)} filas "
+      f"duplicadas, {calidad_datos.get('valores_negativos_corregidos', 0)} valores negativos "
+      f"corregidos, {calidad_datos.get('outliers_detectados', 0)} outliers detectados")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # PASO 9: EMPAQUETAR TODO COMO JSON PARA EL FRONTEND
 # ════════════════════════════════════════════════════════════════════════════
 DATA = {
@@ -394,6 +551,10 @@ DATA = {
     "mesInicioDefecto": fecha_inicio.strftime("%Y-%m"),
     "mesFinDefecto": fecha_max.strftime("%Y-%m"),
     "generadoEl": datetime.now().strftime("%d-%m-%Y %H:%M"),
+    "pronosticos": pronosticos_compactos,
+    "clasificacion": clasificacion_abc_xyz,
+    "calidadDatos": calidad_datos,
+    "metodologia": METODOLOGIA,
 }
 
 # json.dumps con ensure_ascii=False para no reventar el archivo con \uXXXX;
@@ -419,6 +580,7 @@ PLANTILLA = r"""<!DOCTYPE html>
 <style>
 :root{
     --urgente:#FF4444; --normal:#FFD966; --ok:#70AD47; --sinconsumo:#BFBFBF; --header:#1F4E79;
+    --sobrestock:#4472C4; --banda80:rgba(31,78,121,0.22); --banda95:rgba(31,78,121,0.10);
 }
 *{ box-sizing:border-box; }
 body{
@@ -469,6 +631,26 @@ header p{ margin:6px 0 0; font-size:13px; opacity:.85; }
 .badge-NORMAL{ background:var(--normal); color:#5c4a00; }
 .badge-OK{ background:var(--ok); }
 .badge-SINCONSUMO,.badge-SIN.CONSUMO{ background:var(--sinconsumo); color:#333; }
+.badge-ROJO{ background:var(--urgente); }
+.badge-AMARILLO{ background:var(--normal); color:#5c4a00; }
+.badge-VERDE{ background:var(--ok); }
+.badge-AZUL{ background:var(--sobrestock); }
+
+/* Módulo de pronóstico */
+.aviso-incertidumbre{ font-size:12px; color:#7a5c00; background:#FFF7DE; border:1px solid #FFE79A; border-radius:6px; padding:8px 12px; margin:0 0 14px; }
+.leyenda-semaforo{ display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:#444; margin-bottom:12px; }
+.leyenda-semaforo span{ display:flex; align-items:center; gap:6px; }
+.punto{ display:inline-block; width:11px; height:11px; border-radius:50%; }
+.metodologia-lista{ margin:6px 0 16px; padding-left:20px; font-size:13px; color:#333; line-height:1.6; }
+.metodologia-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; margin-bottom:14px; }
+.metodologia-dato{ background:#F7F9FC; border-radius:8px; padding:10px 12px; }
+.metodologia-dato b{ display:block; color:var(--header); font-size:13px; }
+.metodologia-dato span{ font-size:12px; color:#666; }
+#btnDescargarCSV, #btnDescargarExcel{
+    background:#fff; color:var(--header); border:1px solid var(--header); border-radius:6px;
+    padding:8px 14px; font-size:13px; cursor:pointer; margin-right:10px; margin-top:8px;
+}
+#btnDescargarCSV:hover, #btnDescargarExcel:hover{ background:#EEF3FA; }
 
 /* Sub-filtros de gráfico de línea */
 .chart-filtros{ display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; }
@@ -573,6 +755,116 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
             <tbody id="tablaBody"></tbody>
         </table>
     </div>
+</div>
+
+<div class="panel" style="border-left:6px solid var(--header)">
+    <h2>Pronóstico de demanda y abastecimiento</h2>
+    <p class="aviso-incertidumbre">
+        Estas cifras son estimaciones estadísticas obtenidas con modelos de series de tiempo
+        y están sujetas a incertidumbre — no son valores exactos. Revisa la sección
+        "Metodología" al final de la página para conocer los modelos, supuestos y limitaciones.
+    </p>
+</div>
+
+<section class="panel filtros-bar" id="filtrosPronostico">
+    <div class="filtro-grupo"><label>Horizonte</label>
+        <select id="pHorizonte">
+            <option value="3">3 meses</option>
+            <option value="6">6 meses</option>
+            <option value="12" selected>12 meses</option>
+        </select>
+    </div>
+    <div class="filtro-grupo"><label>Nivel de servicio</label>
+        <select id="pNivelServicio">
+            <option value="90">90%</option>
+            <option value="95" selected>95%</option>
+            <option value="97.5">97.5%</option>
+            <option value="99">99%</option>
+        </select>
+    </div>
+    <div class="filtro-grupo"><label>Ámbito de stock</label>
+        <select id="pAmbitoStock">
+            <option value="red" selected>Red completa</option>
+            <option value="bfc">Solo BFC</option>
+        </select>
+    </div>
+    <div class="filtro-grupo"><label>Lead time (días)</label>
+        <input type="number" id="pLeadTime" value="15" min="0" step="1">
+    </div>
+    <div class="filtro-grupo"><label>Múltiplo de compra</label>
+        <input type="number" id="pMultiplo" value="1" min="1" step="1">
+    </div>
+    <div class="filtro-grupo"><label>Stock en tránsito (manual)</label>
+        <input type="number" id="pStockTransito" value="0" min="0" step="1">
+    </div>
+    <div class="filtro-grupo"><label>Método de pronóstico</label>
+        <select id="pMetodo"><option value="__ALL__">Todos</option></select>
+    </div>
+    <div class="filtro-grupo"><label>Clasificación ABC</label>
+        <select id="pABC">
+            <option value="__ALL__">Todas</option><option value="A">A</option>
+            <option value="B">B</option><option value="C">C</option>
+        </select>
+    </div>
+    <div class="filtro-grupo"><label>Clasificación XYZ</label>
+        <select id="pXYZ">
+            <option value="__ALL__">Todas</option><option value="X">X</option>
+            <option value="Y">Y</option><option value="Z">Z</option><option value="N/D">N/D</option>
+        </select>
+    </div>
+    <div class="filtro-grupo"><label>Categoría / Programa</label>
+        <select id="pCategoria"><option value="__ALL__">Todas</option></select>
+    </div>
+    <button id="btnResetPronostico">Limpiar filtros de pronóstico</button>
+</section>
+
+<section class="kpis" id="kpiPronostico"></section>
+
+<div class="panel chart-panel">
+    <div class="chart-panel-head">
+        <h2>Consumo histórico, pronóstico e intervalos de predicción</h2>
+        <div class="chart-filtros">
+            <span class="ficha-sub">Usa el buscador de medicamento individual más abajo para elegir el producto.</span>
+        </div>
+    </div>
+    <div id="chartPronostico"></div>
+    <div id="infoModeloSerie" class="ficha-sub" style="margin-top:8px"></div>
+</div>
+
+<div class="panel">
+    <h2>Tabla de priorización por riesgo de abastecimiento</h2>
+    <div class="leyenda-semaforo">
+        <span><i class="punto" style="background:var(--urgente)"></i> Rojo: quiebre probable</span>
+        <span><i class="punto" style="background:var(--normal)"></i> Amarillo: cobertura insuficiente</span>
+        <span><i class="punto" style="background:var(--ok)"></i> Verde: cobertura adecuada</span>
+        <span><i class="punto" style="background:var(--sobrestock)"></i> Azul: posible sobrestock</span>
+    </div>
+    <input id="pTablaSearch" placeholder="Buscar por código, medicamento o proveedor...">
+    <div class="contador-tabla" id="pTablaContador"></div>
+    <div class="tabla-wrap">
+        <table id="tablaPronostico">
+            <thead><tr id="pTablaHead"></tr></thead>
+            <tbody id="pTablaBody"></tbody>
+        </table>
+    </div>
+    <div>
+        <button id="btnDescargarCSV">Descargar CSV</button>
+        <button id="btnDescargarExcel">Descargar Excel</button>
+    </div>
+</div>
+
+<div class="panel" id="panelMetodologia">
+    <h2>Metodología</h2>
+    <div class="metodologia-grid" id="metodologiaDatos"></div>
+    <p><b>Reglas de historia mínima:</b></p>
+    <ul class="metodologia-lista" id="metodologiaReglas"></ul>
+    <p><b>Métricas de desempeño usadas (nunca MAPE):</b> <span id="metodologiaMetricas"></span></p>
+    <p><b>Supuestos:</b></p>
+    <ul class="metodologia-lista" id="metodologiaSupuestos"></ul>
+    <p><b>Limitaciones:</b></p>
+    <ul class="metodologia-lista" id="metodologiaLimitaciones"></ul>
+    <p><b>Calidad de datos detectada en la última corrida:</b></p>
+    <ul class="metodologia-lista" id="metodologiaCalidad"></ul>
 </div>
 
 <footer>Generado automáticamente por generar_dashboard_completo.py — no requiere conexión a internet</footer>
@@ -863,7 +1155,8 @@ function mostrarFicha(codigo){
       <div class="ficha-graficos">
         <div id="fichaLinea"></div>
         <div id="fichaCentros"></div>
-      </div>`;
+      </div>
+      <div id="fichaClasificacion" class="ficha-sub" style="margin-top:10px"></div>`;
 
     const serie = consumoByCodigo[codigo] || [];
     Plotly.newPlot("fichaLinea", [{
@@ -887,6 +1180,13 @@ function mostrarFicha(codigo){
     }], layoutBase({ title:{text:"Desglose de consumo por centro (histórico)", font:{size:13}}, height:320,
         margin:{l:10,r:20,t:36,b:35}, yaxis:{automargin:true} }),
     PLOTLY_CONFIG);
+
+    const cls = clasificacion[String(codigo)];
+    document.getElementById("fichaClasificacion").textContent = cls
+        ? `Clasificación ABC: ${cls.abc} · XYZ: ${cls.xyz}`
+        : "Clasificación ABC/XYZ no disponible (sin historia suficiente).";
+
+    renderChartPronostico(codigo);
 }
 
 document.getElementById("buscadorInput").addEventListener("change", e=>{
@@ -1005,6 +1305,394 @@ document.getElementById("btnReset").addEventListener("click", ()=>{
 
 construyeCabecera();
 renderTodo();
+
+/* ══════════════════════════════════════════════════════════════════════
+   MÓDULO DE PRONÓSTICO DE DEMANDA Y ABASTECIMIENTO
+   Reutiliza fmtNum/fmtCLP/fmtCompacto/layoutBase/PLOTLY_CONFIG/normaliza y
+   los datos ya cargados (productos, productoByCodigo, consumoByCodigo,
+   centros, centroIndex) — no se toca nada de lo anterior.
+   ══════════════════════════════════════════════════════════════════════ */
+const pronosticos   = DATA.pronosticos   || [];
+const clasificacion = DATA.clasificacion || {};
+const calidadDatos  = DATA.calidadDatos  || {};
+const metodologia   = DATA.metodologia   || {};
+const modelosDesc   = metodologia.modelosDesc || {};
+
+const Z_NIVEL_SERVICIO = {"90":1.2816, "95":1.6449, "97.5":1.9600, "99":2.3263};
+
+const pronoPorClave = {};
+pronosticos.forEach(pr => { pronoPorClave[pr.c + "|" + pr.e] = pr; });
+function pronoRed(codigo){ return pronoPorClave[codigo + "|RED"]; }
+function pronoEstablecimiento(codigo, idxCentro){ return pronoPorClave[codigo + "|" + idxCentro]; }
+
+let codigoSeleccionadoPronostico = null;
+let filasPronosticoActuales = [];
+let pSortKey = "mesesCobertura", pSortDir = 1;
+
+function sumarMeses(mesStr, n){
+    const [y, m] = mesStr.split("-").map(Number);
+    const d = new Date(y, m - 1 + n, 1);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+}
+
+function obtenerParametrosPronostico(){
+    return {
+        horizonte: Number(document.getElementById("pHorizonte").value),
+        z: Z_NIVEL_SERVICIO[document.getElementById("pNivelServicio").value] ?? 1.6449,
+        ambito: document.getElementById("pAmbitoStock").value,
+        leadTimeDias: Math.max(0, Number(document.getElementById("pLeadTime").value) || 0),
+        multiplo: Math.max(1, Number(document.getElementById("pMultiplo").value) || 1),
+        stockTransito: Math.max(0, Number(document.getElementById("pStockTransito").value) || 0),
+        umbralSobrestock: 6,
+    };
+}
+
+/* ── Indicadores de abastecimiento (se recalculan en vivo, sin volver a
+   ejecutar Python, para que cambiar lead time/nivel de servicio/múltiplo
+   sea instantáneo). Ámbito de stock: como los archivos Sal_Art_* no traen
+   una columna que los vincule con las columnas de establecimiento de
+   Consumos_Historicos, el stock solo se puede evaluar a nivel red completa
+   o BFC (ver panel de Metodología) ── */
+function calcularAbastecimiento(p, pr, params){
+    const h = params.horizonte;
+    const forecastH = pr.f.slice(0, h);
+    const demandaMensualProm = forecastH.reduce((a, b) => a + b, 0) / h;
+    const demandaHorizonte = forecastH.reduce((a, b) => a + b, 0);
+    const stockDisponible = params.ambito === "bfc" ? p.saldoBfc : p.totalSaldos;
+    const leadTimeMeses = params.leadTimeDias / 30;
+    const stockSeguridad = params.z * pr.sig * Math.sqrt(Math.max(leadTimeMeses, 1 / 30));
+
+    const mesesCobertura = demandaMensualProm > 0 ? stockDisponible / demandaMensualProm : null;
+
+    let acumulado = 0, mesQuiebreIdx = null;
+    for (let i = 0; i < pr.f.length; i++){
+        acumulado += pr.f[i];
+        if (acumulado >= stockDisponible){ mesQuiebreIdx = i; break; }
+    }
+    const fechaQuiebreLabel = mesQuiebreIdx === null
+        ? "Sin quiebre en 12 meses" : sumarMeses(DATA.mesFinDefecto, mesQuiebreIdx + 1);
+
+    const bruto = demandaHorizonte + stockSeguridad - stockDisponible - params.stockTransito;
+    const cantidadSugerida = bruto > 0 ? Math.ceil(bruto / params.multiplo) * params.multiplo : 0;
+    const gastoProyectado = cantidadSugerida * p.ultPrecio;
+    const riesgoSobrestock = mesesCobertura !== null && mesesCobertura > params.umbralSobrestock;
+
+    let semaforo;
+    if (demandaMensualProm <= 0){
+        semaforo = stockDisponible > 0 ? "AZUL" : "VERDE";
+    } else if (mesQuiebreIdx !== null && mesQuiebreIdx <= Math.ceil(leadTimeMeses)){
+        semaforo = "ROJO";
+    } else if (mesesCobertura < leadTimeMeses + 1){
+        semaforo = "AMARILLO";
+    } else if (riesgoSobrestock){
+        semaforo = "AZUL";
+    } else {
+        semaforo = "VERDE";
+    }
+
+    return { demandaMensualProm, demandaHorizonte, stockDisponible, stockSeguridad,
+        mesesCobertura, fechaQuiebreLabel, cantidadSugerida, gastoProyectado, riesgoSobrestock, semaforo };
+}
+
+function construirFilasPronostico(){
+    const params = obtenerParametrosPronostico();
+    const metodoSel = document.getElementById("pMetodo").value;
+    const abcSel = document.getElementById("pABC").value;
+    const xyzSel = document.getElementById("pXYZ").value;
+    const catSel = document.getElementById("pCategoria").value;
+    const q = normaliza(document.getElementById("pTablaSearch").value.trim());
+
+    const filas = [];
+    productos.forEach(p => {
+        const pr = pronoRed(p.codigo);
+        if (!pr) return;
+        const cls = clasificacion[String(p.codigo)] || { abc: "C", xyz: "N/D" };
+        if (abcSel !== "__ALL__" && cls.abc !== abcSel) return;
+        if (xyzSel !== "__ALL__" && cls.xyz !== xyzSel) return;
+        if (metodoSel !== "__ALL__" && pr.mod !== metodoSel) return;
+        if (catSel !== "__ALL__" && (p.categoria || "Sin categoría") !== catSel) return;
+        if (q){
+            const hit = normaliza(p.medicamento).includes(q) || normaliza(p.proveedor).includes(q) || String(p.codigo).includes(q);
+            if (!hit) return;
+        }
+        const ab = calcularAbastecimiento(p, pr, params);
+        filas.push({
+            codigo: p.codigo, medicamento: p.medicamento, proveedor: p.proveedor,
+            abc: cls.abc, xyz: cls.xyz, modelo: pr.mod, modeloDesc: modelosDesc[pr.mod] || pr.mod,
+            nivelConfianza: pr.nc, wape: pr.wape,
+            mesesCobertura: ab.mesesCobertura, fechaQuiebreLabel: ab.fechaQuiebreLabel,
+            cantidadSugerida: ab.cantidadSugerida, gastoProyectado: ab.gastoProyectado,
+            demandaHorizonte: ab.demandaHorizonte, semaforo: ab.semaforo,
+        });
+    });
+    return filas;
+}
+
+/* ── KPIs ─────────────────────────────────────────────────────────────── */
+function renderKPIsPronostico(filas){
+    const cont = document.getElementById("kpiPronostico");
+    const consumoHist = filas.reduce((s, f) => {
+        const p = productoByCodigo[f.codigo]; return s + (p ? p.consumoMensual * 12 : 0);
+    }, 0);
+    const demandaProy = filas.reduce((s, f) => s + f.demandaHorizonte, 0);
+    const gastoProy = filas.reduce((s, f) => s + f.gastoProyectado, 0);
+    const coberturas = filas.map(f => f.mesesCobertura).filter(v => v != null && isFinite(v));
+    const coberturaProm = coberturas.length ? coberturas.reduce((a, b) => a + b, 0) / coberturas.length : null;
+    const nRojo = filas.filter(f => f.semaforo === "ROJO").length;
+
+    cont.innerHTML = `
+      <div class="kpi-card" style="border-top-color:var(--header)">
+        <div class="kpi-valor" style="color:var(--header)">${fmtNum(consumoHist)}</div>
+        <div class="kpi-etiqueta">CONSUMO ÚLTIMOS 12M</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--header)">
+        <div class="kpi-valor" style="color:var(--header)">${fmtNum(demandaProy)}</div>
+        <div class="kpi-etiqueta">DEMANDA PROYECTADA</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--header)" title="${fmtCLP(gastoProy)}">
+        <div class="kpi-valor" style="color:var(--header)">${fmtCompacto(gastoProy)}</div>
+        <div class="kpi-etiqueta">GASTO PROYECTADO</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--ok)">
+        <div class="kpi-valor" style="color:var(--ok)">${coberturaProm != null ? coberturaProm.toFixed(1) : "s/d"}</div>
+        <div class="kpi-etiqueta">COBERTURA PROMEDIO (MESES)</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--urgente)">
+        <div class="kpi-valor" style="color:var(--urgente)">${fmtNum(nRojo)}</div>
+        <div class="kpi-etiqueta">PRODUCTOS EN RIESGO DE QUIEBRE</div>
+      </div>`;
+}
+
+/* ── Gráfico de consumo + pronóstico + intervalos (producto seleccionado) ── */
+function renderChartPronostico(codigo){
+    codigoSeleccionadoPronostico = codigo;
+    const p = productoByCodigo[codigo];
+    const info = document.getElementById("infoModeloSerie");
+
+    const centroSel = fCentro.value;
+    let pr = null, etiqueta = "toda la red";
+    if (centroSel !== "__ALL__" && centroIndex[centroSel] !== undefined){
+        const candidato = pronoEstablecimiento(codigo, centroIndex[centroSel]);
+        if (candidato){ pr = candidato; etiqueta = centroSel; }
+    }
+    if (!pr) pr = pronoRed(codigo);
+
+    if (!p || !pr){
+        Plotly.purge("chartPronostico");
+        info.textContent = "No hay pronóstico disponible para este producto/establecimiento (historia insuficiente o sin consumo real).";
+        return;
+    }
+
+    const params = obtenerParametrosPronostico();
+    const h = params.horizonte;
+    const serieHist = consumoByCodigo[codigo] || [];
+    const xHist = serieHist.map(r => r.m);
+    const yHist = serieHist.map(r => r.v.reduce((a, b) => a + b, 0));
+
+    const mesesFuturos = [];
+    for (let i = 1; i <= h; i++) mesesFuturos.push(sumarMeses(DATA.mesFinDefecto, i));
+
+    const trazas = [
+        { x: xHist, y: yHist, name: "Consumo histórico", mode: "lines+markers", type: "scatter",
+          line: { color: "#1F4E79", width: 2.5 }, marker: { size: 5 },
+          hovertemplate: "%{x}<br><b>%{y:,.0f} unid.</b><extra>Histórico</extra>" },
+        { x: mesesFuturos, y: pr.u9.slice(0, h), name: "Límite superior 95%", mode: "lines",
+          line: { width: 0 }, showlegend: false, hoverinfo: "skip" },
+        { x: mesesFuturos, y: pr.l9.slice(0, h), name: "Intervalo 95%", mode: "lines",
+          line: { width: 0 }, fill: "tonexty", fillcolor: "rgba(31,78,121,0.10)", hoverinfo: "skip" },
+        { x: mesesFuturos, y: pr.u8.slice(0, h), name: "Límite superior 80%", mode: "lines",
+          line: { width: 0 }, showlegend: false, hoverinfo: "skip" },
+        { x: mesesFuturos, y: pr.l8.slice(0, h), name: "Intervalo 80%", mode: "lines",
+          line: { width: 0 }, fill: "tonexty", fillcolor: "rgba(31,78,121,0.22)", hoverinfo: "skip" },
+        { x: mesesFuturos, y: pr.f.slice(0, h), name: "Pronóstico", mode: "lines+markers", type: "scatter",
+          line: { color: "#C0504D", width: 2.5, dash: "dash" }, marker: { size: 5 },
+          hovertemplate: "%{x}<br><b>%{y:,.0f} unid.</b><extra>Pronóstico</extra>" },
+    ];
+
+    Plotly.react("chartPronostico", trazas, layoutBase({
+        title: { text: `${p.medicamento} — consumo e intervalos (${etiqueta})`, font: { size: 14 } },
+        height: 420, hovermode: "x unified", margin: { t: 44 },
+        xaxis: { title: "Mes" }, yaxis: { title: "Unidades", rangemode: "tozero" },
+        legend: { orientation: "h", y: -0.22, font: { size: 10 } },
+    }), PLOTLY_CONFIG);
+
+    const wapeTxt = pr.wape != null ? (pr.wape * 100).toFixed(1) + "%" : "sin datos suficientes";
+    info.innerHTML = `Modelo seleccionado: <b>${modelosDesc[pr.mod] || pr.mod}</b> · `
+        + `Confianza: <b>${pr.nc}</b> · WAPE (backtest): <b>${wapeTxt}</b> · `
+        + `Sesgo: <b>${pr.sesgo != null ? fmtNum(pr.sesgo) : "s/d"}</b>`;
+}
+
+/* ── Tabla de priorización por riesgo ─────────────────────────────────── */
+const COLUMNAS_PRONOSTICO = [
+    { key: "codigo", label: "Código", num: true },
+    { key: "medicamento", label: "Medicamento", num: false },
+    { key: "abc", label: "ABC", num: false },
+    { key: "xyz", label: "XYZ", num: false },
+    { key: "modeloDesc", label: "Modelo", num: false },
+    { key: "nivelConfianza", label: "Confianza", num: false },
+    { key: "wape", label: "WAPE", num: true },
+    { key: "mesesCobertura", label: "Cobertura (meses)", num: true },
+    { key: "fechaQuiebreLabel", label: "Quiebre estimado", num: false },
+    { key: "cantidadSugerida", label: "Compra sugerida", num: true },
+    { key: "gastoProyectado", label: "Gasto proyectado", num: true },
+    { key: "semaforo", label: "Semáforo", num: false },
+];
+
+function construyeCabeceraPronostico(){
+    const tr = document.getElementById("pTablaHead");
+    tr.innerHTML = "";
+    COLUMNAS_PRONOSTICO.forEach(col => {
+        const th = document.createElement("th");
+        const flecha = col.key === pSortKey ? (pSortDir === 1 ? "▲" : "▼") : "";
+        th.innerHTML = `${col.label} <span class="arrow">${flecha}</span>`;
+        th.addEventListener("click", () => {
+            if (pSortKey === col.key) pSortDir *= -1; else { pSortKey = col.key; pSortDir = 1; }
+            construyeCabeceraPronostico();
+            renderTablaDesdeFilas(filasPronosticoActuales);
+        });
+        tr.appendChild(th);
+    });
+}
+
+function renderTablaDesdeFilas(filas){
+    const ordenadas = filas.slice().sort((a, b) => {
+        let av = a[pSortKey], bv = b[pSortKey];
+        if (av === null || av === undefined) av = pSortDir === 1 ? Infinity : -Infinity;
+        if (bv === null || bv === undefined) bv = pSortDir === 1 ? Infinity : -Infinity;
+        if (av < bv) return -1 * pSortDir;
+        if (av > bv) return 1 * pSortDir;
+        return 0;
+    });
+
+    document.getElementById("pTablaContador").textContent = `${ordenadas.length} de ${productos.length} productos con pronóstico`;
+
+    const tbody = document.getElementById("pTablaBody");
+    const frag = document.createDocumentFragment();
+    ordenadas.forEach(f => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+            <td>${f.codigo}</td>
+            <td>${f.medicamento}</td>
+            <td>${f.abc}</td>
+            <td>${f.xyz}</td>
+            <td>${f.modeloDesc}</td>
+            <td>${f.nivelConfianza}</td>
+            <td class="num">${f.wape != null ? (f.wape * 100).toFixed(1) + "%" : "s/d"}</td>
+            <td class="num">${f.mesesCobertura != null ? f.mesesCobertura.toFixed(1) : "s/c"}</td>
+            <td>${f.fechaQuiebreLabel}</td>
+            <td class="num">${fmtNum(f.cantidadSugerida)}</td>
+            <td class="num" title="${fmtCLP(f.gastoProyectado)}">${fmtCompacto(f.gastoProyectado)}</td>
+            <td><span class="badge badge-${f.semaforo}">${f.semaforo}</span></td>`;
+        frag.appendChild(tr);
+    });
+    tbody.innerHTML = "";
+    tbody.appendChild(frag);
+}
+
+function renderTodoPronostico(){
+    const filas = construirFilasPronostico();
+    filasPronosticoActuales = filas;
+    renderKPIsPronostico(filas);
+    renderTablaDesdeFilas(filas);
+    if (codigoSeleccionadoPronostico !== null) renderChartPronostico(codigoSeleccionadoPronostico);
+}
+
+/* ── Descarga CSV / Excel (sin librerías externas, 100% offline) ────────── */
+function csvEsc(s){
+    s = String(s ?? "");
+    return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function descargarBlob(contenido, nombre, tipo){
+    const blob = new Blob(["﻿" + contenido], { type: tipo });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = nombre;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+const ENCABEZADOS_EXPORT = ["Código", "Medicamento", "Proveedor", "ABC", "XYZ", "Modelo", "Confianza",
+    "WAPE", "Cobertura (meses)", "Quiebre estimado", "Compra sugerida", "Gasto proyectado", "Semáforo"];
+function filaExport(f){
+    return [f.codigo, f.medicamento, f.proveedor, f.abc, f.xyz, f.modeloDesc, f.nivelConfianza,
+        f.wape != null ? (f.wape * 100).toFixed(1) + "%" : "", f.mesesCobertura != null ? f.mesesCobertura.toFixed(1) : "",
+        f.fechaQuiebreLabel, f.cantidadSugerida, Math.round(f.gastoProyectado), f.semaforo];
+}
+function exportarCSV(){
+    const lineas = [ENCABEZADOS_EXPORT.join(";")];
+    filasPronosticoActuales.forEach(f => lineas.push(filaExport(f).map(csvEsc).join(";")));
+    descargarBlob(lineas.join("\n"), "pronostico_abastecimiento.csv", "text/csv;charset=utf-8;");
+}
+function exportarExcel(){
+    let html = "<table><tr>" + ENCABEZADOS_EXPORT.map(h => `<th>${h}</th>`).join("") + "</tr>";
+    filasPronosticoActuales.forEach(f => {
+        html += "<tr>" + filaExport(f).map(v => `<td>${String(v ?? "").replace(/</g, "&lt;")}</td>`).join("") + "</tr>";
+    });
+    html += "</table>";
+    descargarBlob(html, "pronostico_abastecimiento.xls", "application/vnd.ms-excel");
+}
+
+/* ── Metodología (estática, se arma una sola vez) ────────────────────────── */
+function renderMetodologia(){
+    const m = metodologia, cal = calidadDatos;
+    document.getElementById("metodologiaDatos").innerHTML = `
+      <div class="metodologia-dato"><b>${m.periodoEntrenamiento || "s/d"}</b><span>Período de entrenamiento</span></div>
+      <div class="metodologia-dato"><b>${(m.horizontes || []).join(" / ")} meses</b><span>Horizontes de pronóstico</span></div>
+      <div class="metodologia-dato"><b>${DATA.generadoEl}</b><span>Fecha de última actualización</span></div>
+      <div class="metodologia-dato"><b>${fmtNum(cal.n_series_con_pronostico)}</b><span>Series código+establecimiento pronosticadas</span></div>`;
+    document.getElementById("metodologiaReglas").innerHTML = (m.reglasHistoria || []).map(t => `<li>${t}</li>`).join("");
+    document.getElementById("metodologiaMetricas").textContent = (m.metricas || []).join(", ");
+    document.getElementById("metodologiaSupuestos").innerHTML = (m.supuestos || []).map(t => `<li>${t}</li>`).join("");
+    document.getElementById("metodologiaLimitaciones").innerHTML = (m.limitaciones || []).map(t => `<li>${t}</li>`).join("");
+    document.getElementById("metodologiaCalidad").innerHTML = `
+      <li>${fmtNum(cal.n_codigos)} códigos analizados, ${fmtNum(cal.codigos_historia_insuficiente)} con historia insuficiente (menos de 12 meses).</li>
+      <li>${fmtNum(cal.duplicados_codigo_fecha)} filas código+fecha duplicadas detectadas y consolidadas.</li>
+      <li>${fmtNum(cal.valores_negativos_corregidos)} valores negativos detectados y corregidos a 0.</li>
+      <li>${fmtNum(cal.outliers_detectados)} valores atípicos detectados (no eliminados, solo señalados).</li>
+      <li>${fmtNum(cal.total_meses_ausentes)} meses sin registro detectados en total (distinto de consumo cero explícito).</li>`;
+}
+
+function poblarFiltrosPronostico(){
+    const modelosPresentes = new Set();
+    pronosticos.forEach(pr => { if (pr.e === "RED") modelosPresentes.add(pr.mod); });
+    const pMetodo = document.getElementById("pMetodo");
+    Array.from(modelosPresentes).sort().forEach(mo => pMetodo.appendChild(new Option(modelosDesc[mo] || mo, mo)));
+
+    const categorias = new Set(productos.map(p => p.categoria || "Sin categoría"));
+    const pCategoria = document.getElementById("pCategoria");
+    Array.from(categorias).sort().forEach(c => pCategoria.appendChild(new Option(c, c)));
+}
+
+["pHorizonte", "pNivelServicio", "pAmbitoStock", "pLeadTime", "pMultiplo", "pStockTransito",
+ "pMetodo", "pABC", "pXYZ", "pCategoria"].forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener("change", renderTodoPronostico);
+    if (el.tagName === "INPUT") el.addEventListener("input", renderTodoPronostico);
+});
+document.getElementById("pTablaSearch").addEventListener("input", renderTodoPronostico);
+fCentro.addEventListener("change", () => {
+    if (codigoSeleccionadoPronostico !== null) renderChartPronostico(codigoSeleccionadoPronostico);
+});
+document.getElementById("btnResetPronostico").addEventListener("click", () => {
+    document.getElementById("pHorizonte").value = "12";
+    document.getElementById("pNivelServicio").value = "95";
+    document.getElementById("pAmbitoStock").value = "red";
+    document.getElementById("pLeadTime").value = 15;
+    document.getElementById("pMultiplo").value = 1;
+    document.getElementById("pStockTransito").value = 0;
+    document.getElementById("pMetodo").value = "__ALL__";
+    document.getElementById("pABC").value = "__ALL__";
+    document.getElementById("pXYZ").value = "__ALL__";
+    document.getElementById("pCategoria").value = "__ALL__";
+    document.getElementById("pTablaSearch").value = "";
+    renderTodoPronostico();
+});
+document.getElementById("btnDescargarCSV").addEventListener("click", exportarCSV);
+document.getElementById("btnDescargarExcel").addEventListener("click", exportarExcel);
+
+construyeCabeceraPronostico();
+poblarFiltrosPronostico();
+renderMetodologia();
+renderTodoPronostico();
 </script>
 </body>
 </html>

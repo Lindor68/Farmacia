@@ -11,6 +11,7 @@ pedido_proyectado_backup.xlsx
 resumen_stock_BFC.xlsx
 resumen_stock_BFC_backup.xlsx
 dashboard_farmacia.html
+.pronostico_cache.pkl
 
 # Python
 __pycache__/
