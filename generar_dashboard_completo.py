@@ -696,6 +696,11 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
 </header>
 
 <section class="panel filtros-bar">
+    <div class="filtro-grupo" style="flex:1 1 280px;">
+        <label>Medicamento (código o nombre)</label>
+        <input id="buscadorInput" list="datalistMedicamentos" placeholder="Todos los medicamentos...">
+        <datalist id="datalistMedicamentos"></datalist>
+    </div>
     <div class="filtro-grupo">
         <label>Mes desde</label>
         <select id="fMesDesde"></select>
@@ -722,7 +727,6 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
         <h2>Consumo histórico mes a mes</h2>
         <div class="chart-filtros">
             <select id="lineCentro"><option value="__ALL__">Todos los centros</option></select>
-            <select id="lineArticulo"><option value="__ALL__">Todos los artículos (filtrados por alerta)</option></select>
         </div>
     </div>
     <div id="chartLinea"></div>
@@ -739,10 +743,8 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
 </div>
 
 <div class="panel">
-    <h2>Buscador de medicamento individual</h2>
-    <input id="buscadorInput" list="datalistMedicamentos" placeholder="Escribe código o nombre del medicamento...">
-    <datalist id="datalistMedicamentos"></datalist>
-    <div id="fichaContenido" class="ficha-vacia">Selecciona un medicamento del buscador para ver su ficha completa.</div>
+    <h2>Ficha del medicamento seleccionado</h2>
+    <div id="fichaContenido" class="ficha-vacia">Escribe un código o nombre en el buscador de arriba para ver su ficha completa.</div>
 </div>
 
 <div class="panel">
@@ -824,7 +826,7 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
     <div class="chart-panel-head">
         <h2>Consumo histórico, pronóstico e intervalos de predicción</h2>
         <div class="chart-filtros">
-            <span class="ficha-sub">Usa el buscador de medicamento individual más abajo para elegir el producto.</span>
+            <span class="ficha-sub">Usa el buscador de medicamento de arriba (barra de filtros) para elegir el producto.</span>
         </div>
     </div>
     <div id="chartPronostico"></div>
@@ -908,8 +910,13 @@ const fMesHasta = document.getElementById("fMesHasta");
 const fCentro   = document.getElementById("fCentro");
 const fAlertaBox = document.getElementById("fAlerta");
 const lineCentro   = document.getElementById("lineCentro");
-const lineArticulo = document.getElementById("lineArticulo");
 const datalistMed  = document.getElementById("datalistMedicamentos");
+const buscadorInput = document.getElementById("buscadorInput");
+
+/* Medicamento seleccionado globalmente (código o null = ninguno / todos).
+   Un único buscador maneja la ficha, el gráfico de línea, el desglose por
+   centro, el resaltado en ranking/proyección y el filtro de la tabla. */
+let medicamentoSel = null;
 
 meses.forEach(m=>{
     fMesDesde.appendChild(new Option(m, m));
@@ -933,7 +940,6 @@ ORDEN_ALERTA.forEach(niv=>{
 const medicamentosOrdenados = productos.slice().sort((a,b)=>a.medicamento.localeCompare(b.medicamento));
 medicamentosOrdenados.forEach(p=>{
     datalistMed.appendChild(new Option(`${p.codigo} - ${p.medicamento}`));
-    lineArticulo.appendChild(new Option(`${p.codigo} - ${p.medicamento}`, p.codigo));
 });
 
 document.getElementById("headerMeta").textContent =
@@ -1011,13 +1017,12 @@ function renderLineChart(){
     const [desde, hasta] = rangoMeses();
     const mesesRango = meses.filter(m=>m>=desde && m<=hasta);
     const centroSel = lineCentro.value;
-    const articuloSel = lineArticulo.value;
 
     let codigosConsiderar;
-    if (articuloSel === "__ALL__") {
+    if (medicamentoSel === null) {
         codigosConsiderar = new Set(productosFiltrados().map(p=>p.codigo));
     } else {
-        codigosConsiderar = new Set([Number(articuloSel)]);
+        codigosConsiderar = new Set([medicamentoSel]);
     }
 
     const totales = {}; mesesRango.forEach(m=>totales[m]=0);
@@ -1028,9 +1033,9 @@ function renderLineChart(){
         totales[row.m] += val;
     });
 
-    const titulo = articuloSel === "__ALL__"
+    const titulo = medicamentoSel === null
         ? `Consumo total ${centroSel === "__ALL__" ? "de la red" : "en " + centroSel} (productos con la alerta seleccionada)`
-        : `Consumo de "${productoByCodigo[Number(articuloSel)]?.medicamento ?? articuloSel}" ${centroSel === "__ALL__" ? "(toda la red)" : "en " + centroSel}`;
+        : `Consumo de "${productoByCodigo[medicamentoSel]?.medicamento ?? medicamentoSel}" ${centroSel === "__ALL__" ? "(toda la red)" : "en " + centroSel}`;
 
     Plotly.react("chartLinea", [{
         x: mesesRango, y: mesesRango.map(m=>totales[m]),
@@ -1064,9 +1069,12 @@ function renderRanking(){
         .slice(0, 20)
         .reverse();
 
+    const bordeSel = arr.map(r=> r.codigo === medicamentoSel ? "#1F2937" : "rgba(0,0,0,0)");
+    const anchoSel  = arr.map(r=> r.codigo === medicamentoSel ? 3 : 0);
+
     Plotly.react("chartRanking", [{
         x: arr.map(r=>r.total), y: arr.map(r=>r.nombre.slice(0,42)),
-        type:"bar", orientation:"h", marker:{color:"#70AD47"},
+        type:"bar", orientation:"h", marker:{color:"#70AD47", line:{color:bordeSel, width:anchoSel}},
         text: arr.map(r=>fmtNum(r.total)), textposition:"outside", cliponaxis:false,
         hovertemplate: "%{y}<br><b>%{x:,.0f} unid.</b><extra></extra>",
     }], layoutBase({
@@ -1085,8 +1093,12 @@ function renderStack(){
 
     consumo.forEach(row=>{
         if (row.m < desde || row.m > hasta) return;
-        const p = productoByCodigo[row.c];
-        if (!p || !alertaSet.has(p.alerta)) return;
+        if (medicamentoSel !== null) {
+            if (row.c !== medicamentoSel) return;
+        } else {
+            const p = productoByCodigo[row.c];
+            if (!p || !alertaSet.has(p.alerta)) return;
+        }
         row.v.forEach((val,i)=>{ matriz[row.m][i] += val; totalesPorCentro[i] += val; });
     });
 
@@ -1100,8 +1112,12 @@ function renderStack(){
     }));
 
     Plotly.react("chartStack", trazas, layoutBase({
+        title: medicamentoSel !== null
+            ? { text:`Desglose por centro — ${productoByCodigo[medicamentoSel]?.medicamento ?? medicamentoSel}`, font:{size:13} }
+            : undefined,
         barmode:"stack", height:440, hovermode:"x unified",
-        margin:{b:70}, xaxis:{title:"Mes"}, yaxis:{title:"Unidades consumidas"},
+        margin:{b:70, t: medicamentoSel !== null ? 40 : 20},
+        xaxis:{title:"Mes"}, yaxis:{title:"Unidades consumidas"},
         legend:{orientation:"h", y:-0.28, font:{size:10}},
     }), PLOTLY_CONFIG);
 }
@@ -1109,12 +1125,14 @@ function renderStack(){
 /* ── Proyección de consumo a 3 y 6 meses ─────────────────────────────── */
 function renderProy(){
     const activos = productosFiltrados().slice().sort((a,b)=>b.proy6-a.proy6).slice(0,15).reverse();
+    const bordeSel = activos.map(p=> p.codigo === medicamentoSel ? "#1F2937" : "rgba(0,0,0,0)");
+    const anchoSel  = activos.map(p=> p.codigo === medicamentoSel ? 3 : 0);
     Plotly.react("chartProy", [
         { x: activos.map(p=>p.proy3), y: activos.map(p=>p.medicamento.slice(0,40)),
-          name:"Proyección 3 meses", type:"bar", orientation:"h", marker:{color:"#FFD966"},
+          name:"Proyección 3 meses", type:"bar", orientation:"h", marker:{color:"#FFD966", line:{color:bordeSel, width:anchoSel}},
           hovertemplate: "%{y}<br><b>%{x:,.0f} unid.</b><extra>3 meses</extra>" },
         { x: activos.map(p=>p.proy6), y: activos.map(p=>p.medicamento.slice(0,40)),
-          name:"Proyección 6 meses", type:"bar", orientation:"h", marker:{color:"#1F4E79"},
+          name:"Proyección 6 meses", type:"bar", orientation:"h", marker:{color:"#1F4E79", line:{color:bordeSel, width:anchoSel}},
           hovertemplate: "%{y}<br><b>%{x:,.0f} unid.</b><extra>6 meses</extra>" },
     ], layoutBase({
         barmode:"group", height:440, margin:{l:10,r:20,t:40,b:40},
@@ -1130,8 +1148,13 @@ function extraeCodigo(texto){
 }
 
 function mostrarFicha(codigo){
-    const p = productoByCodigo[codigo];
     const cont = document.getElementById("fichaContenido");
+    if (codigo === null){
+        cont.innerHTML = '<div class="ficha-vacia">Escribe un código o nombre en el buscador de arriba para ver su ficha completa.</div>';
+        renderChartPronostico(null);
+        return;
+    }
+    const p = productoByCodigo[codigo];
     if (!p){ cont.innerHTML = '<div class="ficha-vacia">No se encontró ese medicamento. Elige una opción de la lista.</div>'; return; }
 
     const badgeClase = "badge-" + p.alerta.replace(/\s+/g,"");
@@ -1189,9 +1212,23 @@ function mostrarFicha(codigo){
     renderChartPronostico(codigo);
 }
 
-document.getElementById("buscadorInput").addEventListener("change", e=>{
-    const codigo = extraeCodigo(e.target.value);
-    if (codigo !== null) mostrarFicha(codigo);
+/* ── Selección unificada de medicamento: un solo buscador mueve todos los
+   módulos (ficha, línea, desglose por centro, resaltado en ranking/proyección
+   y filtro de la tabla) ────────────────────────────────────────────────── */
+function seleccionarMedicamento(codigo){
+    medicamentoSel = codigo;
+    const p = codigo !== null ? productoByCodigo[codigo] : null;
+    buscadorInput.value = p ? `${p.codigo} - ${p.medicamento}` : "";
+    mostrarFicha(codigo);
+    renderTodo();
+    renderTodoPronostico();
+}
+
+buscadorInput.addEventListener("change", e=>{
+    const texto = e.target.value.trim();
+    if (!texto) { seleccionarMedicamento(null); return; }
+    const codigo = extraeCodigo(texto);
+    if (codigo !== null) seleccionarMedicamento(codigo);
 });
 
 /* ── Tabla resumen ordenable y filtrable ─────────────────────────────── */
@@ -1231,15 +1268,22 @@ function construyeCabecera(){
 }
 
 function renderTabla(){
-    const alertaSet = getAlertaSet();
-    const q = normaliza(document.getElementById("tablaSearch").value.trim());
-    let filas = productos.filter(p=>alertaSet.has(p.alerta));
-    if (q) {
-        filas = filas.filter(p =>
-            normaliza(p.medicamento).includes(q) ||
-            normaliza(p.proveedor).includes(q) ||
-            String(p.codigo).includes(q)
-        );
+    let filas;
+    if (medicamentoSel !== null) {
+        // Con un medicamento seleccionado en el buscador global, la tabla se
+        // reduce a esa fila (igual criterio que la ficha y el gráfico de línea).
+        filas = productos.filter(p=>p.codigo === medicamentoSel);
+    } else {
+        const alertaSet = getAlertaSet();
+        const q = normaliza(document.getElementById("tablaSearch").value.trim());
+        filas = productos.filter(p=>alertaSet.has(p.alerta));
+        if (q) {
+            filas = filas.filter(p =>
+                normaliza(p.medicamento).includes(q) ||
+                normaliza(p.proveedor).includes(q) ||
+                String(p.codigo).includes(q)
+            );
+        }
     }
     filas = filas.slice().sort((a,b)=>{
         const av = a[sortKey], bv = b[sortKey];
@@ -1289,7 +1333,6 @@ function renderTodo(){
 [fMesDesde, fMesHasta, fCentro].forEach(el=>el.addEventListener("change", renderTodo));
 fAlertaBox.addEventListener("change", renderTodo);
 lineCentro.addEventListener("change", renderLineChart);
-lineArticulo.addEventListener("change", renderLineChart);
 document.getElementById("tablaSearch").addEventListener("input", renderTabla);
 
 document.getElementById("btnReset").addEventListener("click", ()=>{
@@ -1298,13 +1341,13 @@ document.getElementById("btnReset").addEventListener("click", ()=>{
     fCentro.value = "__ALL__";
     fAlertaBox.querySelectorAll("input[type=checkbox]").forEach(chk=>chk.checked = true);
     lineCentro.value = "__ALL__";
-    lineArticulo.value = "__ALL__";
     document.getElementById("tablaSearch").value = "";
-    renderTodo();
+    seleccionarMedicamento(null);
 });
 
 construyeCabecera();
 renderTodo();
+renderChartPronostico(null);
 
 /* ══════════════════════════════════════════════════════════════════════
    MÓDULO DE PRONÓSTICO DE DEMANDA Y ABASTECIMIENTO
@@ -1394,8 +1437,30 @@ function calcularAbastecimiento(p, pr, params){
         mesesCobertura, fechaQuiebreLabel, cantidadSugerida, gastoProyectado, riesgoSobrestock, semaforo };
 }
 
+function construirFilaPronostico(p, pr, params){
+    const cls = clasificacion[String(p.codigo)] || { abc: "C", xyz: "N/D" };
+    const ab = calcularAbastecimiento(p, pr, params);
+    return {
+        codigo: p.codigo, medicamento: p.medicamento, proveedor: p.proveedor,
+        abc: cls.abc, xyz: cls.xyz, modelo: pr.mod, modeloDesc: modelosDesc[pr.mod] || pr.mod,
+        nivelConfianza: pr.nc, wape: pr.wape,
+        mesesCobertura: ab.mesesCobertura, fechaQuiebreLabel: ab.fechaQuiebreLabel,
+        cantidadSugerida: ab.cantidadSugerida, gastoProyectado: ab.gastoProyectado,
+        demandaHorizonte: ab.demandaHorizonte, semaforo: ab.semaforo,
+    };
+}
+
 function construirFilasPronostico(){
     const params = obtenerParametrosPronostico();
+
+    if (medicamentoSel !== null){
+        // Con un medicamento seleccionado en el buscador global, la tabla de
+        // priorización se reduce a esa fila (igual criterio que la tabla resumen).
+        const p = productoByCodigo[medicamentoSel];
+        const pr = p ? pronoRed(medicamentoSel) : null;
+        return (p && pr) ? [construirFilaPronostico(p, pr, params)] : [];
+    }
+
     const metodoSel = document.getElementById("pMetodo").value;
     const abcSel = document.getElementById("pABC").value;
     const xyzSel = document.getElementById("pXYZ").value;
@@ -1415,15 +1480,7 @@ function construirFilasPronostico(){
             const hit = normaliza(p.medicamento).includes(q) || normaliza(p.proveedor).includes(q) || String(p.codigo).includes(q);
             if (!hit) return;
         }
-        const ab = calcularAbastecimiento(p, pr, params);
-        filas.push({
-            codigo: p.codigo, medicamento: p.medicamento, proveedor: p.proveedor,
-            abc: cls.abc, xyz: cls.xyz, modelo: pr.mod, modeloDesc: modelosDesc[pr.mod] || pr.mod,
-            nivelConfianza: pr.nc, wape: pr.wape,
-            mesesCobertura: ab.mesesCobertura, fechaQuiebreLabel: ab.fechaQuiebreLabel,
-            cantidadSugerida: ab.cantidadSugerida, gastoProyectado: ab.gastoProyectado,
-            demandaHorizonte: ab.demandaHorizonte, semaforo: ab.semaforo,
-        });
+        filas.push(construirFilaPronostico(p, pr, params));
     });
     return filas;
 }
@@ -1466,8 +1523,13 @@ function renderKPIsPronostico(filas){
 /* ── Gráfico de consumo + pronóstico + intervalos (producto seleccionado) ── */
 function renderChartPronostico(codigo){
     codigoSeleccionadoPronostico = codigo;
-    const p = productoByCodigo[codigo];
     const info = document.getElementById("infoModeloSerie");
+    if (codigo === null){
+        Plotly.purge("chartPronostico");
+        info.textContent = "Selecciona un medicamento en el buscador de arriba para ver su pronóstico.";
+        return;
+    }
+    const p = productoByCodigo[codigo];
 
     const centroSel = fCentro.value;
     let pr = null, etiqueta = "toda la red";
