@@ -37,6 +37,15 @@ import pronostico_demanda
 
 carpeta = Path(__file__).resolve().parent
 
+TOTAL_PASOS = 10
+
+
+def _log_paso(n, mensaje):
+    """Indicador de avance del pipeline (10 pasos, de la lectura de los
+    Excel de origen a la escritura final del dashboard HTML)."""
+    print(f"\n[Paso {n}/{TOTAL_PASOS}] {mensaje}")
+
+
 # ── Parámetros del negocio: tocar aquí si cambian las reglas ──────────────────
 BODEGA_BFC              = "Sal_Art_BFC"     # bodega de droguería: la que compra/distribuye
 BODEGAS_EXCLUIR_STOCK   = {"Sal_Art_ETHON"} # no son puntos reales de stock de la red
@@ -110,6 +119,7 @@ def leer_archivo_stock(ruta):
     return df
 
 
+_log_paso(1, "Leyendo y consolidando el stock de todas las bodegas (Sal_Art_*.xlsx)...")
 archivos_stock = sorted(carpeta.glob("Sal_Art_*.xlsx"))
 if not archivos_stock:
     raise FileNotFoundError(f"No se encontraron archivos Sal_Art_*.xlsx en {carpeta}")
@@ -144,6 +154,7 @@ cons.to_excel(carpeta / "consolidado.xlsx", index=False)
 # ════════════════════════════════════════════════════════════════════════════
 # PASO 2: CALCULAR LOS SALDOS QUE PIDE EL RESUMEN, A PARTIR DEL STOCK CONSOLIDADO
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(2, "Calculando saldos de stock (BFC y red completa)...")
 bfc = cons[cons["origen"] == BODEGA_BFC].copy()
 if bfc.empty:
     raise ValueError(f"No se encontró la bodega '{BODEGA_BFC}' entre los Sal_Art_*.xlsx")
@@ -163,6 +174,37 @@ total_saldos = (red.groupby("Código", as_index=False)["Stock Actual"].sum()
 resto = red[red["origen"] != BODEGA_BFC]
 total_max_resto = (resto.groupby("Código", as_index=False)["Stock Máx."].sum()
                     .rename(columns={"Stock Máx.": "Total Máximos (excepto BFC)"}))
+
+# Saldo por establecimiento (una fila por bodega de la red): se usa tanto
+# para el total de la red (panel resumen sin producto seleccionado) como
+# para el desglose por producto (panel filtrado al medicamento elegido).
+precio_por_codigo = dict(zip(saldo_bfc["Código"], saldo_bfc["Ult. Precio"]))
+red_est = red.copy()
+red_est["centro"]     = red_est["origen"].str.replace("Sal_Art_", "", regex=False)
+red_est["_precio"]    = red_est["Código"].map(precio_por_codigo).fillna(0)
+red_est["_valor"]     = red_est["Stock Actual"] * red_est["_precio"]
+red_est["_con_stock"] = (red_est["Stock Actual"] > 0).astype(int)
+saldo_por_establecimiento = (
+    red_est.groupby("centro", as_index=False)
+    .agg(unidades=("Stock Actual", "sum"),
+         productos=("_con_stock", "sum"),
+         valor=("_valor", "sum"))
+    .sort_values("valor", ascending=False)
+)
+
+# Desglose de saldo por producto x establecimiento (para el panel cuando hay
+# un medicamento seleccionado): una matriz Código -> [unidades por centro],
+# alineada con `centros_stock` en el mismo orden para todos los productos.
+centros_stock = sorted(set(red_est["centro"]))
+_pivot_stock = (
+    red_est.groupby(["Código", "centro"], as_index=False)["Stock Actual"].sum()
+    .pivot(index="Código", columns="centro", values="Stock Actual")
+    .reindex(columns=centros_stock, fill_value=0)
+    .fillna(0)
+)
+saldo_centros_por_codigo = {
+    int(cod): [float(v) for v in fila] for cod, fila in zip(_pivot_stock.index, _pivot_stock.values)
+}
 
 nombres = (cons.drop_duplicates("Código")[["Código", "Nombre Artículo", "Proveedor"]]
            .rename(columns={"Nombre Artículo": "Medicamento"}))
@@ -189,6 +231,7 @@ def _categoria_de(codigo):
 # (resumen/proyecciones) como para la serie mes a mes del dashboard, en una
 # sola lectura del archivo.
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(3, "Leyendo el consumo histórico (Consumos_Historicos.xlsx)...")
 if not RUTA_CONSUMOS.exists():
     raise FileNotFoundError(f"No se encontró {RUTA_CONSUMOS.name} en {carpeta}")
 
@@ -241,6 +284,7 @@ print(f"Consumo calculado sobre {fecha_inicio.date()} a {fecha_max.date()} "
 # ════════════════════════════════════════════════════════════════════════════
 # PASO 4: CRUZAR STOCK + CONSUMO EN UNA SOLA TABLA
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(4, "Cruzando stock y consumo en una sola tabla...")
 df = arsenal.merge(saldo_bfc,       on="Código", how="left")
 df = df.merge(total_saldos,         on="Código", how="left")
 df = df.merge(total_max_resto,      on="Código", how="left")
@@ -262,6 +306,7 @@ df["Valor Stock Total"] = (df["Total Saldos"] * df["Ult. Precio"]).round(0).asty
 # ════════════════════════════════════════════════════════════════════════════
 # PASO 5: PROYECCIÓN DE CONSUMO, NECESIDAD DE COMPRA Y ALERTAS DE STOCK
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(5, "Calculando proyecciones, necesidad de compra y alertas de stock...")
 for m in MESES_PROYECCION:
     df[f"Proyección Consumo {m}M"] = (df["Consumo Mensual"] * m).round(0).astype(int)
     df[f"Necesidad Compra {m}M"]   = (
@@ -303,6 +348,7 @@ print(f"Alertas:\n{salida['Alerta Stock'].value_counts().to_string()}")
 # PASO 6: GUARDAR EL RESUMEN EN EXCEL, CON FORMATO Y COLORES POR ALERTA
 # (queda como respaldo/auditoría; el dashboard ya no depende de releerlo)
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(6, "Guardando el resumen en Excel (resumen_stock_BFC.xlsx)...")
 fill_urg  = PatternFill(fill_type="solid", fgColor="FF4444")
 fill_nor  = PatternFill(fill_type="solid", fgColor="FFD966")
 fill_ok   = PatternFill(fill_type="solid", fgColor="70AD47")
@@ -357,6 +403,7 @@ except PermissionError:
 # ════════════════════════════════════════════════════════════════════════════
 # PASO 7: ARMAR LOS DATOS PARA EL BUSCADOR / TABLA DEL DASHBOARD (uno por producto)
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(7, "Armando los datos para el buscador y la tabla del dashboard...")
 productos = []
 for _, r in salida.iterrows():
     productos.append({
@@ -378,6 +425,7 @@ for _, r in salida.iterrows():
         "compra6":        float(r["Necesidad Compra 6M"]),
         "alerta":         str(r["Alerta Stock"]),
         "categoria":      _categoria_de(r["Código"]),
+        "saldoCentros":   saldo_centros_por_codigo.get(int(r["Código"]), [0.0] * len(centros_stock)),
     })
 
 codigos_arsenal = {p["codigo"] for p in productos}
@@ -387,6 +435,7 @@ codigos_arsenal = {p["codigo"] for p in productos}
 # PASO 8: ARMAR LA SERIE DE CONSUMO MES A MES POR PRODUCTO Y POR CENTRO
 # (solo productos del arsenal, para no inflar el archivo con ruido)
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(8, "Armando la serie de consumo mes a mes por producto y centro...")
 centros = [nombre_centro(c) for c in cols_centro]
 
 consumo_arsenal = ch[ch["Codigo"].isin(codigos_arsenal)]
@@ -426,6 +475,7 @@ print(f"Serie de consumo embebida: {len(consumo_serie)} filas (codigo x mes) "
 # (Total Saldos) o "Solo BFC" (Saldo BFC, la bodega central que compra), y se
 # recalculan en el navegador contra el pronóstico agregado de red.
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(9, "Calculando pronóstico de demanda y abastecimiento (puede tardar varios minutos si no hay caché)...")
 RUTA_CACHE_PRONOSTICO = carpeta / ".pronostico_cache.pkl"
 
 
@@ -543,11 +593,18 @@ print(f"Calidad de datos: {calidad_datos.get('codigos_historia_insuficiente', 0)
 # ════════════════════════════════════════════════════════════════════════════
 # PASO 9: EMPAQUETAR TODO COMO JSON PARA EL FRONTEND
 # ════════════════════════════════════════════════════════════════════════════
+_log_paso(10, "Empaquetando los datos y generando el archivo HTML final del dashboard...")
 DATA = {
     "meses": meses,
     "centros": centros,
     "productos": productos,
     "consumo": consumo_serie,
+    "centrosStock": centros_stock,
+    "saldoPorEstablecimiento": [
+        {"centro": r["centro"], "unidades": int(r["unidades"]),
+         "productos": int(r["productos"]), "valor": float(r["valor"])}
+        for _, r in saldo_por_establecimiento.iterrows()
+    ],
     "mesInicioDefecto": fecha_inicio.strftime("%Y-%m"),
     "mesFinDefecto": fecha_max.strftime("%Y-%m"),
     "generadoEl": datetime.now().strftime("%d-%m-%Y %H:%M"),
@@ -646,11 +703,12 @@ header p{ margin:6px 0 0; font-size:13px; opacity:.85; }
 .metodologia-dato{ background:#F7F9FC; border-radius:8px; padding:10px 12px; }
 .metodologia-dato b{ display:block; color:var(--header); font-size:13px; }
 .metodologia-dato span{ font-size:12px; color:#666; }
-#btnDescargarCSV, #btnDescargarExcel{
+#btnDescargarCSV, #btnDescargarExcel, #btnDescargarSolicitud{
     background:#fff; color:var(--header); border:1px solid var(--header); border-radius:6px;
     padding:8px 14px; font-size:13px; cursor:pointer; margin-right:10px; margin-top:8px;
 }
-#btnDescargarCSV:hover, #btnDescargarExcel:hover{ background:#EEF3FA; }
+#btnDescargarCSV:hover, #btnDescargarExcel:hover, #btnDescargarSolicitud:hover{ background:#EEF3FA; }
+#solHorizonte{ padding:6px 9px; border:1px solid #D0D5DD; border-radius:6px; font-size:13px; margin-left:6px; }
 
 /* Sub-filtros de gráfico de línea */
 .chart-filtros{ display:flex; gap:14px; flex-wrap:wrap; margin-bottom:10px; }
@@ -683,6 +741,15 @@ tbody td{ padding:8px; border-bottom:1px solid #EEF0F3; white-space:nowrap; }
 tbody tr:hover{ background:#F5F8FC; }
 .num{ text-align:right; font-variant-numeric:tabular-nums; }
 .contador-tabla{ font-size:12px; color:#666; margin-bottom:8px; }
+
+/* Barra de magnitud (un solo tono, ancho proporcional) para comparar totales
+   dentro de una misma columna sin necesitar un gráfico aparte */
+.celda-barra{ display:flex; align-items:center; gap:8px; justify-content:flex-end; }
+.barra-mini{ position:relative; width:70px; height:8px; background:#EEF3FA; border-radius:4px; overflow:hidden; flex-shrink:0; }
+.barra-mini > div{ position:absolute; top:0; left:0; height:100%; background:var(--header); border-radius:4px; }
+.tendencia-sube{ color:#B03A2E; font-weight:600; }
+.tendencia-baja{ color:#1E7145; font-weight:600; }
+.tendencia-estable{ color:#666; font-weight:600; }
 
 footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
 </style>
@@ -722,6 +789,20 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
 
 <section class="kpis" id="kpiSection"></section>
 
+<div class="panel">
+    <h2>Saldo por establecimiento</h2>
+    <p class="ficha-sub" id="saldoEstablecimientoSub">Stock actual de toda la red, sumando todos los productos del arsenal, por bodega/centro.</p>
+    <div class="tabla-wrap" style="max-height:420px;">
+        <table id="tablaSaldoEstablecimiento">
+            <thead><tr id="saldoEstablecimientoHead">
+                <th>Establecimiento</th><th class="num">Unidades en stock</th>
+                <th class="num">Productos distintos</th><th class="num">Valorización</th>
+            </tr></thead>
+            <tbody id="saldoEstablecimientoBody"></tbody>
+        </table>
+    </div>
+</div>
+
 <div class="panel chart-panel">
     <div class="chart-panel-head">
         <h2>Consumo histórico mes a mes</h2>
@@ -740,6 +821,31 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
 <div class="panel-doble">
     <div class="panel chart-panel"><h2>Comparación de consumo entre centros (apilado)</h2><div id="chartStack"></div></div>
     <div class="panel chart-panel"><h2>Proyección de consumo a 3 y 6 meses</h2><div id="chartProy"></div></div>
+</div>
+
+<div class="panel">
+    <h2>Consumo por establecimiento — últimos 6 meses</h2>
+    <p class="ficha-sub" id="consumoEstablecimientoSub"></p>
+    <div class="tabla-wrap" style="max-height:460px;">
+        <table id="tablaConsumoEstablecimiento">
+            <thead><tr>
+                <th>Establecimiento</th>
+                <th class="num">Total 6M</th>
+                <th class="num">Promedio mensual</th>
+                <th class="num">Máximo mensual</th>
+                <th class="num">Mínimo mensual</th>
+                <th class="num">Participación</th>
+                <th class="num">Tendencia</th>
+            </tr></thead>
+            <tbody id="consumoEstablecimientoBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<div class="panel chart-panel">
+    <h2>Comparación mensual de consumo entre establecimientos</h2>
+    <p class="ficha-sub" id="comparacionMensualSub"></p>
+    <div id="chartComparacionMensual"></div>
 </div>
 
 <div class="panel">
@@ -855,6 +961,57 @@ footer{ text-align:center; color:#888; font-size:12px; margin-top:10px; }
     </div>
 </div>
 
+<div class="panel" id="panelSolicitud">
+    <h2>Solicitud de compra</h2>
+    <p class="ficha-sub">
+        Genera la solicitud de compra (mismo formato que el archivo modelo SOLICITUD) con los
+        productos en riesgo <b>ROJO</b> (quiebre probable) o <b>AMARILLO</b> (cobertura insuficiente)
+        para el horizonte elegido, usando los parámetros de abastecimiento configurados arriba
+        (nivel de servicio, lead time, múltiplo, stock en tránsito, ámbito de stock).
+    </p>
+    <div class="chart-filtros" style="align-items:center;">
+        <label style="font-size:13px;color:#444;">Horizonte de la solicitud
+            <select id="solHorizonte">
+                <option value="3">3 meses</option>
+                <option value="6" selected>6 meses</option>
+                <option value="12">12 meses</option>
+            </select>
+        </label>
+        <button id="btnDescargarSolicitud">Descargar Solicitud (Excel)</button>
+    </div>
+    <div class="contador-tabla" id="solContador"></div>
+</div>
+
+<div class="panel" id="panelGeneradorPedido">
+    <h2>Generador de Pedido — Horizonte Variable</h2>
+    <p class="ficha-sub">
+        Lista los medicamentos con <b>quiebre de stock proyectado dentro del horizonte</b> elegido
+        (según el pronóstico de demanda y los parámetros de abastecimiento configurados arriba:
+        nivel de servicio, lead time, múltiplo, stock en tránsito, ámbito de stock) y calcula la
+        cantidad a pedir para cubrir esa ventana de tiempo. A diferencia de la solicitud por
+        semáforo, aquí el horizonte se ajusta libremente en días, no en tramos fijos de 3/6/12 meses.
+    </p>
+    <div class="chart-filtros" style="align-items:center; gap:16px;">
+        <label style="font-size:13px;color:#444;">
+            Horizonte del pedido: <b id="pedHorizonteLabel">90 días (~3.0 meses)</b><br>
+            <input type="range" id="pedHorizonteDias" min="7" max="365" step="1" value="90"
+                   style="width:280px; vertical-align:middle; margin-top:4px;">
+        </label>
+    </div>
+    <section class="kpis" id="kpiGeneradorPedido"></section>
+    <input id="pedTablaSearch" placeholder="Buscar por código, medicamento o proveedor...">
+    <div class="contador-tabla" id="pedTablaContador"></div>
+    <div class="tabla-wrap">
+        <table id="tablaGeneradorPedido">
+            <thead><tr id="pedTablaHead"></tr></thead>
+            <tbody id="pedTablaBody"></tbody>
+        </table>
+    </div>
+    <div>
+        <button id="btnDescargarPedido">Descargar Pedido (Excel)</button>
+    </div>
+</div>
+
 <div class="panel" id="panelMetodologia">
     <h2>Metodología</h2>
     <div class="metodologia-grid" id="metodologiaDatos"></div>
@@ -881,6 +1038,8 @@ const meses = DATA.meses;
 const productos = DATA.productos;
 const productoByCodigo = {}; productos.forEach(p=>productoByCodigo[p.codigo]=p);
 const consumo = DATA.consumo;
+const saldoPorEstablecimiento = DATA.saldoPorEstablecimiento;
+const centrosStock = DATA.centrosStock;
 
 const consumoByCodigo = {};
 consumo.forEach(row=>{
@@ -1012,6 +1171,54 @@ function renderKPIs(){
     cont.innerHTML = html;
 }
 
+/* ── Saldo por establecimiento: total de la red, o desglose del medicamento
+   seleccionado (independiente de los filtros de mes/centro/alerta) ─────── */
+function renderSaldoEstablecimiento(){
+    const tbody = document.getElementById("saldoEstablecimientoBody");
+    const sub   = document.getElementById("saldoEstablecimientoSub");
+    const head  = document.getElementById("saldoEstablecimientoHead");
+    const p = medicamentoSel !== null ? productoByCodigo[medicamentoSel] : null;
+
+    let filas, colProductos = true;
+    if (p){
+        sub.textContent = `Saldo de "${p.medicamento}" (código ${p.codigo}) por bodega/centro.`;
+        head.innerHTML = `<th>Establecimiento</th><th class="num">Unidades en stock</th><th class="num">Valorización</th>`;
+        colProductos = false;
+        filas = centrosStock
+            .map((c,i)=>({ centro:c, unidades:p.saldoCentros[i], valor:p.saldoCentros[i]*p.ultPrecio }))
+            .filter(r=>r.unidades > 0)
+            .sort((a,b)=>b.unidades - a.unidades);
+    } else {
+        sub.textContent = "Stock actual de toda la red, sumando todos los productos del arsenal, por bodega/centro.";
+        head.innerHTML = `<th>Establecimiento</th><th class="num">Unidades en stock</th><th class="num">Productos distintos</th><th class="num">Valorización</th>`;
+        filas = saldoPorEstablecimiento;
+    }
+
+    const totalUnidades = filas.reduce((s,r)=>s+r.unidades, 0);
+    const totalValor     = filas.reduce((s,r)=>s+r.valor, 0);
+
+    if (!filas.length){
+        tbody.innerHTML = `<tr><td colspan="${colProductos?4:3}">Sin stock registrado en ningún establecimiento.</td></tr>`;
+        return;
+    }
+
+    let html = filas.map(r => `
+        <tr>
+            <td>${r.centro}</td>
+            <td class="num">${fmtNum(r.unidades)}</td>
+            ${colProductos ? `<td class="num">${fmtNum(r.productos)}</td>` : ""}
+            <td class="num">${fmtCLP(r.valor)}</td>
+        </tr>`).join("");
+    html += `
+        <tr style="font-weight:bold; background:#F5F8FC;">
+            <td>TOTAL RED</td>
+            <td class="num">${fmtNum(totalUnidades)}</td>
+            ${colProductos ? `<td class="num"></td>` : ""}
+            <td class="num">${fmtCLP(totalValor)}</td>
+        </tr>`;
+    tbody.innerHTML = html;
+}
+
 /* ── Gráfico de línea: consumo mes a mes filtrable por centro/artículo ─── */
 function renderLineChart(){
     const [desde, hasta] = rangoMeses();
@@ -1122,6 +1329,131 @@ function renderStack(){
     }), PLOTLY_CONFIG);
 }
 
+/* ── Consumo por establecimiento, ventana fija de los últimos 6 meses con
+   datos (no se mueve con los filtros de mes, para que siempre responda la
+   misma pregunta: "¿cómo viene consumiendo cada establecimiento últimamente?").
+   Sin medicamento seleccionado, agrega los productos con la alerta marcada;
+   con uno seleccionado, muestra solo su consumo por centro. ─────────────── */
+function renderConsumoEstablecimientos(){
+    const ultimos6 = meses.slice(-6);
+    const sub  = document.getElementById("consumoEstablecimientoSub");
+    const tbody = document.getElementById("consumoEstablecimientoBody");
+    const rango = ultimos6.length ? `${ultimos6[0]} a ${ultimos6[ultimos6.length - 1]}` : "sin datos";
+
+    let codigosConsiderar;
+    if (medicamentoSel !== null) {
+        const p = productoByCodigo[medicamentoSel];
+        codigosConsiderar = new Set([medicamentoSel]);
+        sub.textContent = `Consumo de "${p?.medicamento ?? medicamentoSel}" por establecimiento (${rango}).`;
+    } else {
+        codigosConsiderar = new Set(productosFiltrados().map(p=>p.codigo));
+        sub.textContent = `Consumo de los productos del arsenal con la alerta seleccionada, por establecimiento (${rango}).`;
+    }
+
+    const porMesCentro = ultimos6.map(()=> new Array(centros.length).fill(0));
+    consumo.forEach(row=>{
+        const idxMes = ultimos6.indexOf(row.m);
+        if (idxMes === -1 || !codigosConsiderar.has(row.c)) return;
+        row.v.forEach((val,i)=>{ porMesCentro[idxMes][i] += val; });
+    });
+
+    const nMeses = ultimos6.length || 1;
+    const mitad = Math.max(1, Math.floor(ultimos6.length / 2));
+    let stats = centros.map((centro,i)=>{
+        const valores = porMesCentro.map(fila=>fila[i]);
+        const total = valores.reduce((a,b)=>a+b, 0);
+        const primeraMitad = valores.slice(0, mitad).reduce((a,b)=>a+b, 0);
+        const segundaMitad = valores.slice(mitad).reduce((a,b)=>a+b, 0);
+        const tendencia = primeraMitad > 0 ? ((segundaMitad - primeraMitad) / primeraMitad) * 100 : null;
+        return {
+            centro, total, promedio: total / nMeses,
+            max: valores.length ? Math.max(...valores) : 0,
+            min: valores.length ? Math.min(...valores) : 0,
+            tendencia,
+        };
+    }).filter(s=>s.total > 0).sort((a,b)=>b.total - a.total);
+
+    if (!stats.length){
+        tbody.innerHTML = `<tr><td colspan="7">Sin consumo registrado en los últimos 6 meses para este filtro.</td></tr>`;
+        return;
+    }
+
+    const totalGeneral = stats.reduce((s,r)=>s+r.total, 0);
+    const maxTotal = stats[0].total;
+
+    tbody.innerHTML = stats.map(s=>{
+        const participacion = totalGeneral ? (s.total / totalGeneral * 100) : 0;
+        const anchoBarra = maxTotal ? (s.total / maxTotal * 100) : 0;
+        let tendCelda = '<span style="color:#888">Sin mes previo</span>';
+        if (s.tendencia !== null){
+            const clase = Math.abs(s.tendencia) < 5 ? "tendencia-estable" : (s.tendencia > 0 ? "tendencia-sube" : "tendencia-baja");
+            const flecha = Math.abs(s.tendencia) < 5 ? "→" : (s.tendencia > 0 ? "▲" : "▼");
+            tendCelda = `<span class="${clase}">${flecha} ${s.tendencia > 0 ? "+" : ""}${s.tendencia.toFixed(0)}%</span>`;
+        }
+        return `<tr>
+            <td>${s.centro}</td>
+            <td class="num"><div class="celda-barra"><div class="barra-mini"><div style="width:${anchoBarra}%"></div></div>${fmtNum(s.total)}</div></td>
+            <td class="num">${fmtNum(s.promedio)}</td>
+            <td class="num">${fmtNum(s.max)}</td>
+            <td class="num">${fmtNum(s.min)}</td>
+            <td class="num">${participacion.toFixed(1)}%</td>
+            <td class="num">${tendCelda}</td>
+        </tr>`;
+    }).join("");
+}
+
+/* ── Comparación mensual de consumo entre establecimientos: una línea por
+   centro para comparar directamente su evolución mes a mes (a diferencia del
+   apilado de arriba, que muestra composición/total, no la trayectoria de
+   cada centro). El color se asigna por identidad del centro (su índice fijo
+   en `centros`), no por su ranking, para que no cambie si la selección de
+   medicamento/alerta hace que algún centro entre o salga del top. ────────── */
+function renderComparacionMensual(){
+    const [desde, hasta] = rangoMeses();
+    const alertaSet = getAlertaSet();
+    const mesesRango = meses.filter(m=>m>=desde && m<=hasta);
+    const sub = document.getElementById("comparacionMensualSub");
+    const matriz = {}; mesesRango.forEach(m=>matriz[m] = new Array(centros.length).fill(0));
+    const totalesPorCentro = new Array(centros.length).fill(0);
+
+    consumo.forEach(row=>{
+        if (row.m < desde || row.m > hasta) return;
+        if (medicamentoSel !== null) {
+            if (row.c !== medicamentoSel) return;
+        } else {
+            const p = productoByCodigo[row.c];
+            if (!p || !alertaSet.has(p.alerta)) return;
+        }
+        row.v.forEach((val,i)=>{ matriz[row.m][i] += val; totalesPorCentro[i] += val; });
+    });
+
+    // Máximo 8 centros a la vez para que el gráfico se pueda leer; se eligen
+    // los de mayor consumo en el rango, pero se listan en orden de índice
+    // (identidad), no de ranking, así el color de cada uno queda fijo.
+    const idxConDatos = totalesPorCentro
+        .map((v,i)=>[i,v]).filter(([,v])=>v>0)
+        .sort((a,b)=>b[1]-a[1]).slice(0,8)
+        .map(([i])=>i).sort((a,b)=>a-b);
+
+    const trazas = idxConDatos.map(i=>({
+        x: mesesRango, y: mesesRango.map(m=>matriz[m][i]),
+        name: centros[i], mode:"lines+markers", type:"scatter",
+        line:{color: PALETA_CENTROS[i % PALETA_CENTROS.length], width:2.5},
+        marker:{size:6, color: PALETA_CENTROS[i % PALETA_CENTROS.length]},
+        hovertemplate: "%{fullData.name}<br>%{x}<br><b>%{y:,.0f} unid.</b><extra></extra>",
+    }));
+
+    sub.textContent = medicamentoSel !== null
+        ? `Consumo mensual de "${productoByCodigo[medicamentoSel]?.medicamento ?? medicamentoSel}" por establecimiento (hasta 8 con mayor consumo en el rango).`
+        : "Consumo mensual de los productos con la alerta seleccionada, por establecimiento (hasta 8 con mayor consumo en el rango).";
+
+    Plotly.react("chartComparacionMensual", trazas, layoutBase({
+        height:440, hovermode:"x unified", margin:{b:70, t:20},
+        xaxis:{title:"Mes"}, yaxis:{title:"Unidades consumidas", rangemode:"tozero"},
+        legend:{orientation:"h", y:-0.28, font:{size:10}},
+    }), PLOTLY_CONFIG);
+}
+
 /* ── Proyección de consumo a 3 y 6 meses ─────────────────────────────── */
 function renderProy(){
     const activos = productosFiltrados().slice().sort((a,b)=>b.proy6-a.proy6).slice(0,15).reverse();
@@ -1174,6 +1506,7 @@ function mostrarFicha(codigo){
         <div class="ficha-kpi"><b>${fmtNum(p.proy3)} / ${fmtNum(p.proy6)}</b><span>Proyección 3M / 6M</span></div>
         <div class="ficha-kpi"><b>${fmtNum(p.compra3)} / ${fmtNum(p.compra6)}</b><span>Necesidad compra 3M / 6M</span></div>
         <div class="ficha-kpi"><b title="${fmtCLP(p.valorStockTotal)}">${fmtCompacto(p.valorStockTotal)}</b><span>Valor stock red</span></div>
+        <div class="ficha-kpi"><b>${fmtCLP(p.ultPrecio * FACTOR_IVA)}</b><span>Precio unitario de referencia (con IVA)</span></div>
       </div>
       <div class="ficha-graficos">
         <div id="fichaLinea"></div>
@@ -1222,9 +1555,10 @@ function seleccionarMedicamento(codigo){
     mostrarFicha(codigo);
     renderTodo();
     renderTodoPronostico();
+    renderSaldoEstablecimiento();
 }
 
-buscadorInput.addEventListener("change", e=>{
+buscadorInput.addEventListener("input", e=>{
     const texto = e.target.value.trim();
     if (!texto) { seleccionarMedicamento(null); return; }
     const codigo = extraeCodigo(texto);
@@ -1326,6 +1660,8 @@ function renderTodo(){
     renderLineChart();
     renderRanking();
     renderStack();
+    renderConsumoEstablecimientos();
+    renderComparacionMensual();
     renderProy();
     renderTabla();
 }
@@ -1347,7 +1683,7 @@ document.getElementById("btnReset").addEventListener("click", ()=>{
 
 construyeCabecera();
 renderTodo();
-renderChartPronostico(null);
+renderSaldoEstablecimiento();
 
 /* ══════════════════════════════════════════════════════════════════════
    MÓDULO DE PRONÓSTICO DE DEMANDA Y ABASTECIMIENTO
@@ -1657,6 +1993,7 @@ function renderTodoPronostico(){
     renderKPIsPronostico(filas);
     renderTablaDesdeFilas(filas);
     if (codigoSeleccionadoPronostico !== null) renderChartPronostico(codigoSeleccionadoPronostico);
+    renderGeneradorPedido();
 }
 
 /* ── Descarga CSV / Excel (sin librerías externas, 100% offline) ────────── */
@@ -1691,6 +2028,317 @@ function exportarExcel(){
     });
     html += "</table>";
     descargarBlob(html, "pronostico_abastecimiento.xls", "application/vnd.ms-excel");
+}
+
+/* ── Solicitud de compra (usa como modelo el formulario SOLICITUD: DETALLE DE
+   REQUERIMIENTO DE BIENES Y/O SERVICIOS UGR) ─────────────────────────────── */
+const FACTOR_IVA = 1.19; // el precio del archivo de origen viene sin IVA
+
+function construirFilasSolicitud(horizonteMeses){
+    const params = Object.assign({}, obtenerParametrosPronostico(), { horizonte: horizonteMeses });
+    const filas = [];
+    productos.forEach(p => {
+        const pr = pronoRed(p.codigo);
+        if (!pr) return;
+        const ab = calcularAbastecimiento(p, pr, params);
+        const enRiesgo = ab.semaforo === "ROJO" || ab.semaforo === "AMARILLO";
+        if (ab.cantidadSugerida > 0 && enRiesgo){
+            const precioConIva = p.ultPrecio * FACTOR_IVA;
+            filas.push({
+                codigo: p.codigo, medicamento: p.medicamento, proveedor: p.proveedor,
+                cantidad: ab.cantidadSugerida, precioUnitario: precioConIva,
+                subtotal: ab.cantidadSugerida * precioConIva, semaforo: ab.semaforo,
+            });
+        }
+    });
+    const ORDEN_RIESGO = { ROJO: 0, AMARILLO: 1 };
+    filas.sort((a, b) => (ORDEN_RIESGO[a.semaforo] - ORDEN_RIESGO[b.semaforo]) || a.medicamento.localeCompare(b.medicamento));
+    return filas;
+}
+
+function exportarSolicitud(){
+    const horizonte = Number(document.getElementById("solHorizonte").value);
+    const filas = construirFilasSolicitud(horizonte);
+    const cont = document.getElementById("solContador");
+    if (!filas.length){
+        cont.textContent = "Ningún producto en riesgo ROJO/AMARILLO necesita compra en ese horizonte con los parámetros actuales.";
+        return;
+    }
+    const hoy = new Date();
+    const fechaLabel = [hoy.getDate(), hoy.getMonth() + 1, hoy.getFullYear()]
+        .map((n, i) => i < 2 ? String(n).padStart(2, "0") : n).join("-");
+    const totalGeneral = filas.reduce((s, f) => s + f.subtotal, 0);
+    const esc = s => String(s ?? "").replace(/</g, "&lt;");
+
+    let html = `<table>
+        <tr><td colspan="12" style="font-size:15px;font-weight:bold;">DETALLE DE REQUERIMIENTO DE BIENES Y/O SERVICIOS UGR</td></tr>
+        <tr><td colspan="12"></td></tr>
+        <tr><td><b>Unidad solicitante</b></td><td colspan="3">Droguería BFC</td><td><b>Fecha</b></td><td colspan="2">${fechaLabel}</td></tr>
+        <tr><td><b>Horizonte de la solicitud</b></td><td colspan="3">${horizonte} meses</td><td><b>Ámbito de stock</b></td><td colspan="2">${document.getElementById("pAmbitoStock").selectedOptions[0].text}</td></tr>
+        <tr><td colspan="12">Incluye solo productos en riesgo ROJO (quiebre probable) o AMARILLO (cobertura insuficiente).</td></tr>
+        <tr><td colspan="12"></td></tr>
+        <tr>
+            <th>ITEM</th><th>CANTIDAD</th><th>UNIDAD DE MEDIDA</th><th>ID CONVENIO MARCO</th>
+            <th>CODIGO AVIS</th><th>PRODUCTO O SERVICIO</th><th>DETALLE (marca, modelo, color, etc.)</th>
+            <th>IMAGEN DEL PRODUCTO</th><th>ENLACE A SITIO WEB DONDE SE VENDA EL PRODUCTO SOLICITADO</th>
+            <th>PRECIO UNITARIO DE REFERENCIA (con IVA)</th><th>SUBTOTAL (con IVA)</th><th>RIESGO</th>
+        </tr>`;
+    filas.forEach((f, i) => {
+        html += `<tr>
+            <td>${i + 1}</td><td>${fmtNum(f.cantidad)}</td><td></td><td></td>
+            <td>${f.codigo}</td><td>${esc(f.medicamento)}</td><td>${esc(f.proveedor)}</td>
+            <td></td><td></td>
+            <td>${fmtCLP(f.precioUnitario)}</td><td>${fmtCLP(f.subtotal)}</td><td>${f.semaforo}</td>
+        </tr>`;
+    });
+    html += `<tr><td colspan="9"></td><td><b>TOTAL</b></td><td><b>${fmtCLP(totalGeneral)}</b></td><td></td></tr>
+    </table>`;
+
+    cont.textContent = `${filas.length} productos en riesgo ROJO/AMARILLO a solicitar · Monto total ${fmtCLP(totalGeneral)}`;
+    descargarBlob(html, `Solicitud_Compra_${horizonte}M_${fechaLabel}.xls`, "application/vnd.ms-excel");
+}
+
+/* ── Generador de Pedido con horizonte variable ────────────────────────────
+   Complementa la "Solicitud de compra" (que usa tramos fijos de 3/6/12 meses
+   y el semáforo de riesgo): aquí el horizonte se elige libremente en días y
+   la lista se arma con el criterio literal que pide el negocio — "productos
+   que tendrán quiebre proyectado en ese horizonte de tiempo" — interpolando
+   el pronóstico mensual para estimar el día en que el stock disponible se
+   agota. ──────────────────────────────────────────────────────────────── */
+const DIAS_POR_MES = 30.4375; // promedio calendario, para convertir días <-> meses de pronóstico
+
+// Demanda acumulada del pronóstico hasta un horizonte fraccionario de meses
+// (p.ej. 3.5 meses = 3 meses completos + la mitad del 4to mes de pronóstico).
+function demandaHastaHorizonteMeses(pr, horizonteMeses){
+    const capMeses = Math.min(Math.max(horizonteMeses, 0), pr.f.length);
+    const mesesCompletos = Math.floor(capMeses);
+    let total = 0;
+    for (let i = 0; i < mesesCompletos; i++) total += pr.f[i];
+    const resto = capMeses - mesesCompletos;
+    if (resto > 0 && mesesCompletos < pr.f.length) total += pr.f[mesesCompletos] * resto;
+    return total;
+}
+
+// Días hasta que la demanda acumulada del pronóstico supere el stock
+// disponible, interpolando linealmente dentro del mes en que ocurre el
+// cruce. Devuelve null si no se proyecta quiebre dentro de los 12 meses de
+// pronóstico disponibles.
+function diasHastaQuiebre(pr, stockDisponible){
+    if (stockDisponible <= 0) return 0;
+    let acumulado = 0;
+    for (let i = 0; i < pr.f.length; i++){
+        const previo = acumulado;
+        acumulado += pr.f[i];
+        if (acumulado >= stockDisponible){
+            const demandaMes = pr.f[i];
+            const fraccion = demandaMes > 0 ? (stockDisponible - previo) / demandaMes : 0;
+            return (i + Math.max(0, Math.min(1, fraccion))) * DIAS_POR_MES;
+        }
+    }
+    return null;
+}
+
+function fechaDesdeDiasForecast(dias){
+    const [y, m] = DATA.mesFinDefecto.split("-").map(Number);
+    const base = new Date(y, m, 1); // primer día del mes siguiente al último dato histórico
+    const fecha = new Date(base.getTime() + dias * 86400000);
+    return fecha.toLocaleDateString("es-CL", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+function calcularPedidoHorizonte(p, pr, horizonteDias, paramsBase){
+    const horizonteMeses = horizonteDias / DIAS_POR_MES;
+    const stockDisponible = paramsBase.ambito === "bfc" ? p.saldoBfc : p.totalSaldos;
+    const diasQuiebre = diasHastaQuiebre(pr, stockDisponible);
+    const dentroHorizonte = diasQuiebre !== null && diasQuiebre <= horizonteDias;
+    const demandaHorizonte = demandaHastaHorizonteMeses(pr, horizonteMeses);
+    const leadTimeMeses = paramsBase.leadTimeDias / 30;
+    const stockSeguridad = paramsBase.z * pr.sig * Math.sqrt(Math.max(leadTimeMeses, 1 / 30));
+    const bruto = demandaHorizonte + stockSeguridad - stockDisponible - paramsBase.stockTransito;
+    const cantidadSugerida = bruto > 0 ? Math.ceil(bruto / paramsBase.multiplo) * paramsBase.multiplo : 0;
+    const precioConIva = p.ultPrecio * FACTOR_IVA;
+    return {
+        dentroHorizonte, diasQuiebre,
+        fechaQuiebreLabel: diasQuiebre !== null ? fechaDesdeDiasForecast(diasQuiebre) : "Sin quiebre en 12 meses",
+        stockDisponible, demandaHorizonte, cantidadSugerida,
+        costo: cantidadSugerida * precioConIva,
+    };
+}
+
+function obtenerHorizonteDias(){
+    return Number(document.getElementById("pedHorizonteDias").value) || 90;
+}
+
+function actualizarLabelHorizonte(){
+    const dias = obtenerHorizonteDias();
+    const mesesEq = dias / DIAS_POR_MES;
+    document.getElementById("pedHorizonteLabel").textContent = `${dias} días (~${mesesEq.toFixed(1)} meses)`;
+}
+
+function construirFilasPedido(){
+    const paramsBase = obtenerParametrosPronostico();
+    const horizonteDias = obtenerHorizonteDias();
+    const q = normaliza(document.getElementById("pedTablaSearch").value.trim());
+
+    // Con un medicamento seleccionado en el buscador global, la lista se
+    // reduce a ese producto (mismo criterio que el resto de las secciones).
+    const universo = medicamentoSel !== null
+        ? productos.filter(p => p.codigo === medicamentoSel)
+        : productos;
+
+    const filas = [];
+    universo.forEach(p => {
+        const pr = pronoRed(p.codigo);
+        if (!pr) return;
+        if (q){
+            const hit = normaliza(p.medicamento).includes(q) || normaliza(p.proveedor).includes(q) || String(p.codigo).includes(q);
+            if (!hit) return;
+        }
+        const ped = calcularPedidoHorizonte(p, pr, horizonteDias, paramsBase);
+        if (!ped.dentroHorizonte) return; // solo productos con quiebre proyectado dentro del horizonte elegido
+        filas.push(Object.assign(
+            { codigo: p.codigo, medicamento: p.medicamento, proveedor: p.proveedor, consumoMensual: p.consumoMensual },
+            ped
+        ));
+    });
+    filas.sort((a, b) => a.diasQuiebre - b.diasQuiebre);
+    return filas;
+}
+
+function renderKPIsGeneradorPedido(filas){
+    const cont = document.getElementById("kpiGeneradorPedido");
+    const totalUnidades = filas.reduce((s, f) => s + f.cantidadSugerida, 0);
+    const totalCosto = filas.reduce((s, f) => s + f.costo, 0);
+    const masProximo = filas.length ? Math.round(filas[0].diasQuiebre) : null;
+    cont.innerHTML = `
+      <div class="kpi-card" style="border-top-color:var(--urgente)">
+        <div class="kpi-valor" style="color:var(--urgente)">${fmtNum(filas.length)}</div>
+        <div class="kpi-etiqueta">PRODUCTOS CON QUIEBRE EN EL HORIZONTE</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--header)">
+        <div class="kpi-valor" style="color:var(--header)">${fmtNum(totalUnidades)}</div>
+        <div class="kpi-etiqueta">UNIDADES A PEDIR</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--header)" title="${fmtCLP(totalCosto)}">
+        <div class="kpi-valor" style="color:var(--header)">${fmtCompacto(totalCosto)}</div>
+        <div class="kpi-etiqueta">COSTO ESTIMADO DEL PEDIDO</div>
+      </div>
+      <div class="kpi-card" style="border-top-color:var(--normal)">
+        <div class="kpi-valor" style="color:#5c4a00">${masProximo !== null ? fmtNum(masProximo) : "—"}</div>
+        <div class="kpi-etiqueta">QUIEBRE MÁS PRÓXIMO (DÍAS)</div>
+      </div>`;
+}
+
+const COLUMNAS_PEDIDO = [
+    { key: "codigo", label: "Código", num: true },
+    { key: "medicamento", label: "Medicamento", num: false },
+    { key: "proveedor", label: "Proveedor", num: false },
+    { key: "stockDisponible", label: "Stock disponible", num: true },
+    { key: "consumoMensual", label: "Consumo mensual", num: true },
+    { key: "diasQuiebre", label: "Días hasta quiebre", num: true },
+    { key: "fechaQuiebreLabel", label: "Fecha estimada de quiebre", num: false },
+    { key: "cantidadSugerida", label: "Cantidad a pedir", num: true },
+    { key: "costo", label: "Costo estimado", num: true },
+];
+let pedSortKey = "diasQuiebre", pedSortDir = 1;
+let filasPedidoActuales = [];
+
+function construyeCabeceraPedido(){
+    const tr = document.getElementById("pedTablaHead");
+    tr.innerHTML = "";
+    COLUMNAS_PEDIDO.forEach(col => {
+        const th = document.createElement("th");
+        const flecha = col.key === pedSortKey ? (pedSortDir === 1 ? "▲" : "▼") : "";
+        th.innerHTML = `${col.label} <span class="arrow">${flecha}</span>`;
+        th.addEventListener("click", () => {
+            if (pedSortKey === col.key) pedSortDir *= -1; else { pedSortKey = col.key; pedSortDir = 1; }
+            construyeCabeceraPedido();
+            renderTablaPedido(filasPedidoActuales);
+        });
+        tr.appendChild(th);
+    });
+}
+
+function renderTablaPedido(filas){
+    const ordenadas = filas.slice().sort((a, b) => {
+        let av = a[pedSortKey], bv = b[pedSortKey];
+        if (av === null || av === undefined) av = pedSortDir === 1 ? Infinity : -Infinity;
+        if (bv === null || bv === undefined) bv = pedSortDir === 1 ? Infinity : -Infinity;
+        if (av < bv) return -1 * pedSortDir;
+        if (av > bv) return 1 * pedSortDir;
+        return 0;
+    });
+
+    document.getElementById("pedTablaContador").textContent =
+        `${ordenadas.length} productos con quiebre proyectado dentro del horizonte elegido`;
+
+    const tbody = document.getElementById("pedTablaBody");
+    const frag = document.createDocumentFragment();
+    ordenadas.forEach(f => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+            <td>${f.codigo}</td>
+            <td>${f.medicamento}</td>
+            <td>${f.proveedor}</td>
+            <td class="num">${fmtNum(f.stockDisponible)}</td>
+            <td class="num">${fmtNum(f.consumoMensual)}</td>
+            <td class="num">${Math.round(f.diasQuiebre)}</td>
+            <td>${f.fechaQuiebreLabel}</td>
+            <td class="num">${fmtNum(f.cantidadSugerida)}</td>
+            <td class="num" title="${fmtCLP(f.costo)}">${fmtCompacto(f.costo)}</td>`;
+        frag.appendChild(tr);
+    });
+    tbody.innerHTML = "";
+    tbody.appendChild(frag);
+}
+
+function renderGeneradorPedido(){
+    actualizarLabelHorizonte();
+    const filas = construirFilasPedido();
+    filasPedidoActuales = filas;
+    renderKPIsGeneradorPedido(filas);
+    renderTablaPedido(filas);
+}
+
+function exportarPedidoHorizonte(){
+    const filas = filasPedidoActuales;
+    if (!filas.length){
+        document.getElementById("pedTablaContador").textContent =
+            "Ningún producto tiene quiebre proyectado dentro del horizonte elegido con los parámetros actuales.";
+        return;
+    }
+    const horizonteDias = obtenerHorizonteDias();
+    const hoy = new Date();
+    const fechaLabel = [hoy.getDate(), hoy.getMonth() + 1, hoy.getFullYear()]
+        .map((n, i) => i < 2 ? String(n).padStart(2, "0") : n).join("-");
+    const totalGeneral = filas.reduce((s, f) => s + f.costo, 0);
+    const esc = s => String(s ?? "").replace(/</g, "&lt;");
+
+    let html = `<table>
+        <tr><td colspan="12" style="font-size:15px;font-weight:bold;">DETALLE DE REQUERIMIENTO DE BIENES Y/O SERVICIOS UGR</td></tr>
+        <tr><td colspan="12"></td></tr>
+        <tr><td><b>Unidad solicitante</b></td><td colspan="3">Droguería BFC</td><td><b>Fecha</b></td><td colspan="2">${fechaLabel}</td></tr>
+        <tr><td><b>Horizonte del pedido</b></td><td colspan="3">${horizonteDias} días (~${(horizonteDias / DIAS_POR_MES).toFixed(1)} meses)</td><td><b>Ámbito de stock</b></td><td colspan="2">${document.getElementById("pAmbitoStock").selectedOptions[0].text}</td></tr>
+        <tr><td colspan="12">Incluye solo productos con quiebre de stock proyectado dentro de ese horizonte, según el pronóstico de demanda.</td></tr>
+        <tr><td colspan="12"></td></tr>
+        <tr>
+            <th>ITEM</th><th>CANTIDAD</th><th>UNIDAD DE MEDIDA</th><th>ID CONVENIO MARCO</th>
+            <th>CODIGO AVIS</th><th>PRODUCTO O SERVICIO</th><th>DETALLE (marca, modelo, color, etc.)</th>
+            <th>IMAGEN DEL PRODUCTO</th><th>ENLACE A SITIO WEB DONDE SE VENDA EL PRODUCTO SOLICITADO</th>
+            <th>PRECIO UNITARIO DE REFERENCIA (con IVA)</th><th>SUBTOTAL (con IVA)</th><th>DÍAS HASTA QUIEBRE</th>
+        </tr>`;
+    filas.forEach((f, i) => {
+        const precioUnitario = f.cantidadSugerida > 0 ? f.costo / f.cantidadSugerida : 0;
+        html += `<tr>
+            <td>${i + 1}</td><td>${fmtNum(f.cantidadSugerida)}</td><td></td><td></td>
+            <td>${f.codigo}</td><td>${esc(f.medicamento)}</td><td>${esc(f.proveedor)}</td>
+            <td></td><td></td>
+            <td>${fmtCLP(precioUnitario)}</td><td>${fmtCLP(f.costo)}</td><td>${Math.round(f.diasQuiebre)}</td>
+        </tr>`;
+    });
+    html += `<tr><td colspan="9"></td><td><b>TOTAL</b></td><td><b>${fmtCLP(totalGeneral)}</b></td><td></td></tr>
+    </table>`;
+
+    descargarBlob(html, `Pedido_Quiebre_${horizonteDias}d_${fechaLabel}.xls`, "application/vnd.ms-excel");
 }
 
 /* ── Metodología (estática, se arma una sola vez) ────────────────────────── */
@@ -1746,14 +2394,22 @@ document.getElementById("btnResetPronostico").addEventListener("click", () => {
     document.getElementById("pXYZ").value = "__ALL__";
     document.getElementById("pCategoria").value = "__ALL__";
     document.getElementById("pTablaSearch").value = "";
+    document.getElementById("pedHorizonteDias").value = 90;
+    document.getElementById("pedTablaSearch").value = "";
     renderTodoPronostico();
 });
 document.getElementById("btnDescargarCSV").addEventListener("click", exportarCSV);
 document.getElementById("btnDescargarExcel").addEventListener("click", exportarExcel);
+document.getElementById("btnDescargarSolicitud").addEventListener("click", exportarSolicitud);
+document.getElementById("pedHorizonteDias").addEventListener("input", renderGeneradorPedido);
+document.getElementById("pedTablaSearch").addEventListener("input", renderGeneradorPedido);
+document.getElementById("btnDescargarPedido").addEventListener("click", exportarPedidoHorizonte);
 
 construyeCabeceraPronostico();
+construyeCabeceraPedido();
 poblarFiltrosPronostico();
 renderMetodologia();
+renderChartPronostico(null);
 renderTodoPronostico();
 </script>
 </body>
@@ -1765,5 +2421,9 @@ html = (PLANTILLA
         .replace("__DATA_JSON__", data_json))
 
 RUTA_DASHBOARD.write_text(html, encoding="utf-8")
-print(f"\nDashboard guardado: {RUTA_DASHBOARD}")
 print(f"Tamaño del archivo: {RUTA_DASHBOARD.stat().st_size / 1024 / 1024:.1f} MB")
+
+print("\n" + "=" * 70)
+print(f"✔ DASHBOARD ACTUALIZADO: {RUTA_DASHBOARD}")
+print(f"  Generado el {datetime.now().strftime('%d-%m-%Y %H:%M')}")
+print("=" * 70)

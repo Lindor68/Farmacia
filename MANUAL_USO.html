@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Manual de uso — Dashboard Farmacia BFC</title>
+<style>
+  :root{
+    --header:#1F4E79; --ok:#70AD47; --warn:#C08A00; --danger:#C0504D;
+    --texto:#1F2937; --sub:#5B6673; --borde:#D9DEE4; --fondo-code:#F3F5F8;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family:"Segoe UI", Arial, sans-serif; color:var(--texto);
+    max-width:880px; margin:0 auto; padding:32px 24px 80px; line-height:1.55;
+    background:#fff;
+  }
+  h1{color:var(--header); font-size:28px; margin-bottom:4px;}
+  .subtitulo{color:var(--sub); margin-top:0; margin-bottom:32px; font-size:15px;}
+  h2{
+    color:var(--header); font-size:20px; margin-top:44px; padding-bottom:8px;
+    border-bottom:2px solid var(--header);
+  }
+  h3{color:var(--texto); font-size:16px; margin-top:24px;}
+  .paso{
+    display:flex; gap:14px; margin:18px 0; padding:14px 16px;
+    background:#F8FAFC; border:1px solid var(--borde); border-radius:8px;
+  }
+  .paso .num{
+    flex:0 0 28px; height:28px; border-radius:50%; background:var(--header);
+    color:#fff; font-weight:700; font-size:14px; display:flex; align-items:center;
+    justify-content:center;
+  }
+  .paso .contenido{flex:1;}
+  .paso .contenido b{display:block; margin-bottom:4px;}
+  code, .codebox{
+    font-family:Consolas, "Courier New", monospace; font-size:13.5px;
+    background:var(--fondo-code); border:1px solid var(--borde); border-radius:6px;
+  }
+  code{padding:2px 6px;}
+  .codebox{display:block; padding:12px 14px; margin:10px 0; white-space:pre-wrap;}
+  table{border-collapse:collapse; width:100%; margin:14px 0; font-size:14px;}
+  th, td{border:1px solid var(--borde); padding:8px 10px; text-align:left; vertical-align:top;}
+  th{background:#F3F5F8; color:var(--header);}
+  .callout{
+    border-radius:8px; padding:12px 16px; margin:16px 0; font-size:14px;
+    border-left:4px solid var(--header); background:#EEF3FA;
+  }
+  .callout.warn{border-left-color:var(--warn); background:#FBF3E3;}
+  .callout.danger{border-left-color:var(--danger); background:#FBEDEC;}
+  .callout b{display:block; margin-bottom:4px;}
+  ul{margin:8px 0; padding-left:22px;}
+  li{margin:4px 0;}
+  .toc{
+    background:#F8FAFC; border:1px solid var(--borde); border-radius:8px;
+    padding:16px 20px; margin-bottom:8px;
+  }
+  .toc a{color:var(--header); text-decoration:none;}
+  .toc a:hover{text-decoration:underline;}
+  .badge{
+    display:inline-block; font-size:11.5px; font-weight:700; padding:2px 8px;
+    border-radius:20px; color:#fff; background:var(--ok);
+  }
+  footer{margin-top:60px; color:var(--sub); font-size:12.5px; border-top:1px solid var(--borde); padding-top:14px;}
+</style>
+</head>
+<body>
+
+<h1>Manual de uso — Dashboard Farmacia BFC</h1>
+<p class="subtitulo">Cómo actualizar los datos cada mes y cómo consultar el dashboard interactivo.</p>
+
+<div class="toc">
+  <b>Contenido</b>
+  <ul>
+    <li><a href="#actualizar">1. Actualizar con archivos nuevos</a></li>
+    <li><a href="#generar">2. Generar el dashboard</a></li>
+    <li><a href="#consultar">3. Consultar el dashboard</a></li>
+    <li><a href="#problemas">4. Problemas frecuentes</a></li>
+  </ul>
+</div>
+
+<h2 id="actualizar">1. Actualizar con archivos nuevos</h2>
+<p>Todo vive en una sola carpeta: <code>C:\Users\lcatalan\App_Python\generadorpedidos</code>. Cada vez que quieras refrescar el dashboard con datos nuevos (por ejemplo, al cierre de mes), solo tienes que reemplazar dos tipos de archivo <b>ahí mismo, con el mismo nombre</b>:</p>
+
+<table>
+  <tr><th>Archivo</th><th>Qué es</th><th>Notas</th></tr>
+  <tr>
+    <td><code>Sal_Art_*.xlsx</code><br>(uno por bodega)</td>
+    <td>Export de stock por bodega/centro. El asterisco es el nombre del centro, por ejemplo <code>Sal_Art_BFC.xlsx</code>, <code>Sal_Art_Hospital1.xlsx</code>, etc.</td>
+    <td><span class="badge">Obligatorio</span> debe existir <code>Sal_Art_BFC.xlsx</code> (es la droguería central). Puedes agregar, quitar o reemplazar los demás centros libremente.</td>
+  </tr>
+  <tr>
+    <td><code>Consumos_Historicos.xlsx</code></td>
+    <td>Histórico de consumo mensual por centro. Se usa para las proyecciones y el pronóstico de demanda.</td>
+    <td><span class="badge">Obligatorio</span> reemplaza el archivo completo (no lo edites a mano).</td>
+  </tr>
+</table>
+
+<div class="callout">
+  <b>Importante</b>
+  Los archivos nuevos deben tener <b>exactamente el mismo nombre</b> que los que reemplazan y quedar en la misma carpeta. No hace falta borrar los viejos primero: al copiar encima, Windows te va a preguntar si quieres reemplazarlos — di que sí.
+</div>
+
+<h2 id="generar">2. Generar el dashboard</h2>
+
+<div class="paso">
+  <div class="num">1</div>
+  <div class="contenido">
+    <b>Abre una terminal en la carpeta del proyecto</b>
+    En el Explorador de Windows, entra a <code>C:\Users\lcatalan\App_Python\generadorpedidos</code>, mantén presionada la tecla <b>Shift</b>, haz clic derecho sobre un espacio vacío de la carpeta y elige <b>"Abrir ventana de PowerShell aquí"</b> (o "Abrir terminal aquí").
+  </div>
+</div>
+
+<div class="paso">
+  <div class="num">2</div>
+  <div class="contenido">
+    <b>Ejecuta el script</b>
+    <div class="codebox">python generar_dashboard_completo.py</div>
+    Va a leer los <code>Sal_Art_*.xlsx</code> y <code>Consumos_Historicos.xlsx</code>, recalcular todo y dejar los resultados en la misma carpeta. La primera vez que corre con datos nuevos puede tardar varios minutos (calcula el pronóstico de demanda para cada producto); las corridas siguientes, si los archivos fuente no cambiaron, son casi instantáneas porque usa una caché interna.
+  </div>
+</div>
+
+<div class="paso">
+  <div class="num">3</div>
+  <div class="contenido">
+    <b>Espera a que termine</b>
+    Cuando ves en la terminal la línea <code>Dashboard guardado: ...dashboard_farmacia.html</code>, ya está listo.
+  </div>
+</div>
+
+<h3>Qué archivos genera</h3>
+<table>
+  <tr><th>Archivo</th><th>Para qué sirve</th></tr>
+  <tr><td><code>dashboard_farmacia.html</code></td><td>El dashboard interactivo — este es el que abres para consultar todo.</td></tr>
+  <tr><td><code>resumen_stock_BFC.xlsx</code></td><td>Planilla de saldos, valorización, proyecciones y alertas, para auditar o imprimir.</td></tr>
+  <tr><td><code>consolidado.xlsx</code></td><td>Stock crudo consolidado de todas las bodegas, por si necesitas revisar el detalle fuente.</td></tr>
+</table>
+
+<div class="callout warn">
+  <b>Si algo falla</b>
+  Si la terminal muestra un error tipo <code>No se encontraron archivos Sal_Art_*.xlsx</code> o <code>No se encontró Consumos_Historicos.xlsx</code>, revisa que los archivos estén en esa misma carpeta y con el nombre correcto. Si dice que <code>resumen_stock_BFC.xlsx</code> está abierto y no se pudo sobrescribir, cierra el Excel que lo tenga abierto y vuelve a correr el script.
+</div>
+
+<h2 id="consultar">3. Consultar el dashboard</h2>
+<p>Haz doble clic en <code>dashboard_farmacia.html</code> — se abre en tu navegador. No necesita internet ni instalar nada, es un archivo autocontenido.</p>
+
+<h3>Buscador global de medicamento</h3>
+<p>Arriba de todo hay un campo <b>"Medicamento (código o nombre)"</b>. Escribe el código o el nombre y elige una opción de la lista que aparece. Al seleccionar un producto, se actualizan juntos:</p>
+<ul>
+  <li>La <b>ficha completa</b> del producto (saldos, mínimos/máximos, consumo, proyecciones, valor de stock, clasificación ABC/XYZ).</li>
+  <li>El gráfico de <b>consumo histórico</b> y el <b>desglose por centro</b>.</li>
+  <li>La <b>tabla resumen</b>, que se reduce a esa única fila.</li>
+  <li>La <b>tabla de priorización por riesgo de abastecimiento</b>, también reducida a ese producto.</li>
+  <li>El gráfico de <b>consumo + pronóstico + intervalos de confianza</b>, en la sección de pronóstico de demanda.</li>
+</ul>
+<p>Para volver a ver todos los productos, borra el contenido del buscador o usa el botón <b>"Limpiar filtros"</b>.</p>
+
+<h3>Tabla de priorización por riesgo de abastecimiento</h3>
+<p>Más abajo puedes ajustar los parámetros del pronóstico (horizonte en meses, nivel de servicio, lead time de compra, múltiplo de compra, stock en tránsito, ámbito del stock) y la tabla se recalcula al instante, sin volver a correr Python. Cada fila trae un semáforo (ROJO/AMARILLO/VERDE/AZUL) que indica el riesgo de quiebre o de sobrestock.</p>
+
+<h3>Descargar informes</h3>
+<p>Al pie de esa tabla están los botones <b>"Descargar CSV"</b> y <b>"Descargar Excel"</b>: exportan exactamente las filas que estás viendo en pantalla en ese momento (si tienes un medicamento seleccionado, exportan solo ese; si no, exportan todo lo filtrado).</p>
+
+<h2 id="problemas">4. Problemas frecuentes</h2>
+
+<div class="callout">
+  <b>El pronóstico no cambia aunque reemplacé los archivos</b>
+  El script usa una caché (<code>.pronostico_cache.pkl</code>, archivo oculto en la misma carpeta) para no recalcular el pronóstico si detecta que los archivos fuente no cambiaron. Si sospechas que quedó desactualizada, bórrala manualmente y vuelve a correr <code>python generar_dashboard_completo.py</code>.
+</div>
+
+<div class="callout warn">
+  <b>Un producto no aparece en la tabla de priorización</b>
+  Es normal: el pronóstico requiere al menos 12 meses de historia de consumo. Los productos con historia insuficiente no tienen fila ahí, aunque sí aparezcan en la tabla resumen.
+</div>
+
+<div class="callout danger">
+  <b>Estoy viendo una versión vieja del dashboard</b>
+  Verifica que estás abriendo el archivo de <code>C:\Users\lcatalan\App_Python\generadorpedidos\dashboard_farmacia.html</code> y no una copia guardada en otra carpeta (por ejemplo, en el Escritorio o en Documents). Si tienes una pestaña del navegador ya abierta, haz un refresco forzado (<code>Ctrl+Shift+R</code>) para asegurarte de que cargue la versión más reciente del archivo.
+</div>
+
+<footer>Manual generado para el proyecto generadorpedidos — actualízalo si cambian los pasos del pipeline.</footer>
+
+</body>
+</html>
